@@ -203,8 +203,53 @@ Cloudflare prints a URL like `https://random-words.trycloudflare.com`.
 > stable URL, deploy the server to a host (Railway, Render, Fly.io, a VPS) or use
 > a named Cloudflare Tunnel.
 
-**Windows users:** the repo includes `start-research-mcp.bat`, which starts both
-the server and the tunnel and copies the connector URL to your clipboard.
+**Windows users:** the repo includes [`scripts/start-tunnel.ps1`](scripts/start-tunnel.ps1),
+which starts the server and the tunnel and copies the connector URL to your
+clipboard (requires `uvx` and `cloudflared` on `PATH`):
+
+```powershell
+$env:SCOPUS_API_KEY = "your-key"
+$env:UNPAYWALL_EMAIL = "you@example.com"
+./scripts/start-tunnel.ps1
+```
+
+---
+
+## Example
+
+A typical research flow in Claude, chaining the tools:
+
+> **You:** Find a recent, highly-cited paper on psychological safety in teams,
+> show me its abstract, and check the lead author's h-index.
+
+> **Claude:**
+> 1. calls `search_scopus("TITLE-ABS-KEY(psychological safety AND teams) AND PUBYEAR > 2020", sort="relevancy")`
+>    → finds *"Psychological safety: A systematic review…"* (Scopus ID `850…`, 312 citations, DOI `10.xxxx/yyyy`)
+> 2. calls `get_abstract_details("850…")`
+>    → returns the abstract text (via CrossRef) plus authors and journal
+> 3. calls `get_author_profile("Amy Edmondson")`
+>    → returns h-index 66, 45,900 citations, ORCID, affiliation Harvard
+> 4. (optional) calls `get_pdf_link("10.xxxx/yyyy")`
+>    → returns an open-access PDF URL if one exists
+>
+> Claude then summarises the abstract and reports the author's standing.
+
+Each tool returns indented JSON, so Claude can reliably parse and combine the
+results.
+
+## Development
+
+```bash
+# install with dev dependencies
+uv pip install -e ".[dev]"      # or: pip install -e ".[dev]"
+
+# run the test suite (offline — all HTTP is mocked, no API key needed)
+pytest
+```
+
+Tests live in [`tests/`](tests/) and mock every external API with
+`httpx.MockTransport`, covering result parsing, `count` clamping, retry/backoff
+on HTTP 429, quota tracking and error paths.
 
 ---
 
