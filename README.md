@@ -1,5 +1,8 @@
 # research-mcp
 
+[![CI](https://github.com/niol-zh/research-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/niol-zh/research-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 An [MCP](https://modelcontextprotocol.io) server for academic literature research.
 It combines a **Scopus** search with three free, open scholarly APIs so you get
 abstracts, author metrics and open-access PDFs without needing institutional
