@@ -220,25 +220,54 @@ $env:UNPAYWALL_EMAIL = "you@example.com"
 
 ## Example
 
-A typical research flow in Claude, chaining the tools:
+A typical research flow in Claude, chaining several tools in one turn:
 
-> **You:** Find a recent, highly-cited paper on psychological safety in teams,
-> show me its abstract, and check the lead author's h-index.
+> **You:** How influential is Amy Edmondson's work, and can you get me an
+> open-access PDF of a recent open-science paper to read?
 
-> **Claude:**
-> 1. calls `search_scopus("TITLE-ABS-KEY(psychological safety AND teams) AND PUBYEAR > 2020", sort="relevancy")`
->    → finds *"Psychological safety: A systematic review…"* (Scopus ID `850…`, 312 citations, DOI `10.xxxx/yyyy`)
-> 2. calls `get_abstract_details("850…")`
->    → returns the abstract text (via CrossRef) plus authors and journal
-> 3. calls `get_author_profile("Amy Edmondson")`
->    → returns h-index 66, 45,900 citations, ORCID, affiliation Harvard
-> 4. (optional) calls `get_pdf_link("10.xxxx/yyyy")`
->    → returns an open-access PDF URL if one exists
->
-> Claude then summarises the abstract and reports the author's standing.
+**1. `get_author_profile("Amy Edmondson")`** → OpenAlex returns disambiguated
+matches with metrics:
 
-Each tool returns indented JSON, so Claude can reliably parse and combine the
-results.
+```json
+{
+  "matches": [
+    {
+      "openalex_id": "A5003931866",
+      "name": "Amy C. Edmondson",
+      "h_index": 66,
+      "citation_count": 45902,
+      "paper_count": 358,
+      "i10_index": 132,
+      "affiliations": ["Harvard University"],
+      "orcid": "0000-0003-4409-913X",
+      "url": "https://openalex.org/A5003931866"
+    }
+  ],
+  "note": "Top 3 matches from OpenAlex — verify by name/affiliation."
+}
+```
+
+**2. `get_pdf_link("10.1371/journal.pone.0173664")`** → Unpaywall finds a gold
+open-access PDF:
+
+```json
+{
+  "doi": "10.1371/journal.pone.0173664",
+  "oa_pdf_url": "https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0173664&type=printable",
+  "oa_status": "gold",
+  "source": "publisher",
+  "journal_is_oa": true
+}
+```
+
+> **Claude:** Amy C. Edmondson (Harvard) has an h-index of 66 across 358 papers
+> with ~45,900 citations — exceptionally influential in organizational behavior.
+> Here is an open-access PDF you can read: [link].
+
+Every tool returns indented JSON, so Claude parses the fields reliably and
+combines results across calls. A full literature search would add
+`search_scopus` (to find papers) and `get_abstract_details` (Scopus metadata +
+abstract text from CrossRef).
 
 ## Development
 
