@@ -272,7 +272,20 @@ async def test_get_citing_papers_openalex(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_citing_papers_defaults_to_scopus(monkeypatch):
+async def test_get_citing_papers_defaults_to_openalex(monkeypatch):
+    """Scopus gates REFEID(), so OpenAlex is the default that actually works on a free key."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "openalex.org" in str(request.url)
+        return httpx.Response(200, json={"meta": {"count": 72}, "results": []})
+
+    monkeypatch.setattr(server, "http_client", lambda: _client(handler))
+    out = await server.get_citing_papers("W123")
+    assert out["direction"] == "forward"
+    assert out["total_citing"] == 72
+
+
+@pytest.mark.asyncio
+async def test_get_citing_papers_scopus_explicit(monkeypatch):
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -280,8 +293,60 @@ async def test_get_citing_papers_defaults_to_scopus(monkeypatch):
         return httpx.Response(200, json={"search-results": {"entry": []}})
 
     monkeypatch.setattr(server, "scopus_client", lambda: _client(handler))
-    await server.get_citing_papers("12345")
+    await server.get_citing_papers("12345", source="scopus")
     assert captured["query"] == "REFEID(12345)"
+
+
+@pytest.mark.asyncio
+async def test_get_citing_papers_explains_restricted_refeid(monkeypatch):
+    """A free Scopus key rejects REFEID(); surface that, not a bare HTTP 400."""
+    def handler(request):
+        return httpx.Response(400, json={"service-error": {"status": {
+            "statusCode": "INVALID_INPUT",
+            "statusText": "Use of certain field restrictions in the search query is not allowed.",
+        }}})
+
+    monkeypatch.setattr(server, "scopus_client", lambda: _client(handler))
+    out = await server.get_citing_papers("12345", source="scopus")
+    assert out["scopus_status"] == "INVALID_INPUT"
+    assert "institutional subscription" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_get_citing_papers_scopus_resolves_doi(monkeypatch):
+    """A DOI must be resolved to a Scopus ID — REFEID(doi) is invalid syntax (HTTP 400)."""
+    queries = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        q = request.url.params.get("query")
+        queries.append(q)
+        if q.startswith("DOI("):
+            return httpx.Response(200, json={"search-results": {"entry": [
+                {"dc:identifier": "SCOPUS_ID:98765", "dc:title": "Seed"},
+            ]}})
+        return httpx.Response(200, json={"search-results": {"entry": []}})
+
+    monkeypatch.setattr(server, "scopus_client", lambda: _client(handler))
+    await server.get_citing_papers("10.1016/j.landusepol.2015.09.032", source="scopus")
+    assert queries[0] == "DOI(10.1016/j.landusepol.2015.09.032)"
+    assert queries[1] == "REFEID(98765)"
+
+
+@pytest.mark.asyncio
+async def test_get_citing_papers_scopus_doi_not_found(monkeypatch):
+    def handler(request):
+        return httpx.Response(200, json={"search-results": {"entry": []}})
+
+    monkeypatch.setattr(server, "scopus_client", lambda: _client(handler))
+    out = await server.get_citing_papers("10.1/unknown", source="scopus")
+    assert "openalex" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_get_citing_papers_scopus_rejects_openalex_id(monkeypatch):
+    monkeypatch.setattr(server, "scopus_client", lambda: _client(lambda r: httpx.Response(200, json={})))
+    out = await server.get_citing_papers("W2156435103", source="scopus")
+    assert "not a Scopus ID or DOI" in out["error"]
 
 
 # ── assess_relevance ──────────────────────────────────────────────────────────

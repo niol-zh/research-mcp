@@ -385,13 +385,46 @@ async def _citing_openalex(identifier: str, count: int) -> dict:
 
 
 async def get_citing_papers(
-    scopus_id: str, count: int = 5, sort: str = "coverDate", source: str = "scopus"
+    scopus_id: str, count: int = 5, sort: str = "coverDate", source: str = "openalex"
 ) -> Any:
-    """Papers citing a document. source='scopus' (default) or 'openalex' (no quota, wider recall)."""
+    """Papers citing a document.
+
+    Defaults to OpenAlex because Scopus gates forward-citation search: REFEID() is a
+    restricted field that returns HTTP 400 INVALID_INPUT without an institutional
+    subscription, so source='scopus' only works for subscribed requestors.
+    """
     if str(source).lower() == "openalex":
         return await _citing_openalex(scopus_id, _clamp_count(count))
-    sid = scopus_id.replace("SCOPUS_ID:", "")
-    return await search_scopus(f"REFEID({sid})", count=count, sort=sort)
+
+    # REFEID() only accepts a Scopus ID. A DOI would build invalid query syntax and
+    # come back as an opaque HTTP 400, so resolve it to a Scopus ID first.
+    kind, value = _classify_identifier(scopus_id)
+    if kind == "doi":
+        matches = await search_scopus(f"DOI({value})", count=1)
+        sid = matches[0].get("scopus_id") if matches else None
+        if not sid:
+            return {
+                "error": f"No Scopus record found for DOI '{value}'. Scopus forward citations need "
+                         "a Scopus ID; try source='openalex', which accepts DOIs directly."
+            }
+        value = sid
+    elif kind != "scopus":
+        return {
+            "error": f"'{scopus_id}' is not a Scopus ID or DOI. Scopus forward citations need a "
+                     "Scopus ID; use source='openalex' for DOIs and OpenAlex work IDs."
+        }
+
+    try:
+        return await search_scopus(f"REFEID({value})", count=count, sort=sort)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 400 and "INVALID_INPUT" in e.response.text:
+            return {
+                "error": "Scopus rejected REFEID(): forward-citation search is a restricted field "
+                         "that needs an institutional subscription. Use source='openalex' — free, "
+                         "no quota, and usually much better coverage.",
+                "scopus_status": "INVALID_INPUT",
+            }
+        raise
 
 
 # ── Backward citations (papers this one cites) ────────────────────────────────
@@ -656,25 +689,27 @@ async def handle_list_tools() -> list[types.Tool]:
         types.Tool(
             name="get_citing_papers",
             description=(
-                "Forward citations: papers that CITE a given document. source='scopus' (default) uses "
-                "the Scopus search endpoint and consumes quota; source='openalex' is free, needs no "
-                "quota and generally has much wider coverage."
+                "Forward citations: papers that CITE a given document, most-cited first. Defaults to "
+                "OpenAlex (free, no quota, wide coverage, accepts a DOI or OpenAlex ID). "
+                "source='scopus' uses REFEID(), a restricted field that only works with an "
+                "institutional Scopus subscription."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "scopus_id": {
                         "type": "string",
-                        "description": "Scopus ID of the document. With source='openalex' a DOI or "
-                                       "OpenAlex work ID is also accepted.",
+                        "description": "Document identifier: a DOI or OpenAlex work ID (default "
+                                       "OpenAlex source), or a Scopus ID.",
                     },
                     "count": _COUNT_SCHEMA,
                     "sort": _SORT_SCHEMA,
                     "source": {
                         "type": "string",
-                        "enum": ["scopus", "openalex"],
-                        "description": "Which database to query. Default 'scopus'.",
-                        "default": "scopus",
+                        "enum": ["openalex", "scopus"],
+                        "description": "Which database to query. Default 'openalex'; 'scopus' "
+                                       "requires an institutional subscription.",
+                        "default": "openalex",
                     },
                 },
                 "required": ["scopus_id"],
@@ -757,7 +792,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
                 args.get("scopus_id") or args["identifier"],
                 count=args.get("count", 5),
                 sort=args.get("sort", "coverDate"),
-                source=args.get("source", "scopus"),
+                source=args.get("source", "openalex"),
             )
         elif name == "get_references":
             result = await get_references(

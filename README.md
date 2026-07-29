@@ -15,7 +15,7 @@ Scopus entitlements.
 | `search_scopus` | Elsevier Scopus | Documents matching a query (title, DOI, citations, …) |
 | `get_abstract_details` | Scopus + [CrossRef](https://www.crossref.org) | Metadata + abstract text |
 | `get_author_profile` | [OpenAlex](https://openalex.org) | h-index, citation count, paper count, affiliations, ORCID |
-| `get_citing_papers` | Scopus **or** OpenAlex | Papers that cite a given document (**forward** citations) |
+| `get_citing_papers` | OpenAlex (default) or Scopus | Papers that cite a given document (**forward** citations) |
 | `get_references` | OpenAlex + CrossRef | Papers cited **by** a given document (**backward** citations) |
 | `assess_relevance` | OpenAlex | Abstract, topics, keywords and term overlap for screening papers against a research context |
 | `get_pdf_link` | [Unpaywall](https://unpaywall.org) | Open-access PDF link for a DOI |
@@ -24,12 +24,15 @@ Scopus entitlements.
 ### Citation traversal in both directions
 
 `get_citing_papers` (forward) and `get_references` (backward) let you walk a
-citation graph from any starting paper. Backward citations **must** come from
-OpenAlex: the Scopus reference view (`view=REF`) returns `401
-AUTHORIZATION_ERROR` without an institutional subscription. OpenAlex also serves
-forward citations for free with much wider recall than the Scopus search
-endpoint — pass `source="openalex"` to `get_citing_papers` to use it and spend no
-quota.
+citation graph from any starting paper. **Both directions rely on OpenAlex**,
+because a free Scopus key can serve neither:
+
+- backward — `view=REF` returns `401 AUTHORIZATION_ERROR`
+- forward — `REFEID()` is a restricted search field and returns `400 INVALID_INPUT`
+
+OpenAlex covers both for free, with no quota and generally wider recall, so it is
+the default for each. Pass a DOI and citation traversal costs no Scopus calls at
+all.
 
 ### Screening papers for relevance
 
@@ -100,7 +103,8 @@ The Scopus tools need an Elsevier Developer API key. It's free to register.
 | Capability | Free key | Notes |
 |------------|:--------:|-------|
 | `search_scopus` | ✅ | Up to ~20,000 requests/week |
-| `get_citing_papers` | ✅ | Uses the search endpoint; `source="openalex"` costs no quota |
+| `get_citing_papers` | ✅ | Via the default `source="openalex"` — free, no quota |
+| Scopus forward citations (`REFEID()`) | ❌ | Restricted search field → HTTP 400 `INVALID_INPUT`; needs an institutional subscription |
 | `get_references` | ✅ | Uses OpenAlex/CrossRef, not Scopus — no quota at all |
 | `assess_relevance` | ✅ | Uses OpenAlex — no quota (unless you pass Scopus IDs) |
 | Scopus full abstract (`view=FULL`) | ❌ | Needs institutional subscription → this server falls back to **CrossRef** |
@@ -339,10 +343,17 @@ Forward citations — papers that **cite** the given document.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `scopus_id` | string | — | Scopus document ID. With `source="openalex"`, a DOI or OpenAlex ID also works |
+| `scopus_id` | string | — | A DOI or OpenAlex work ID (default source), or a Scopus ID |
 | `count` | int | 5 | Results to return (max 25) |
 | `sort` | string | `coverDate` | `coverDate` or `relevancy` (Scopus only) |
-| `source` | string | `scopus` | `scopus` (uses quota) or `openalex` (free, wider recall, most-cited first) |
+| `source` | string | `openalex` | `openalex` (free, no quota, most-cited first) or `scopus` |
+
+> **Why OpenAlex is the default:** Scopus serves forward citations through the
+> `REFEID()` search field, which is **restricted**. On a free key it returns
+> `HTTP 400 INVALID_INPUT` ("Use of certain field restrictions in the search
+> query is not allowed for this requestor"), so `source="scopus"` is only useful
+> with an institutional subscription. If you request it anyway, the tool reports
+> that restriction rather than leaking a bare HTTP error.
 
 ### `get_references`
 Backward citations — papers **cited by** the given document, most-cited first.
