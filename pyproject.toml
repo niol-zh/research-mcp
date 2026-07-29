@@ -1,7 +1,7 @@
 [project]
 name = "research-mcp"
-version = "0.4.0"
-description = "MCP server for academic research: Scopus search, abstracts via CrossRef, author h-index via OpenAlex, OA PDFs via Unpaywall"
+version = "0.5.0"
+description = "MCP server for academic research: Scopus search, forward/backward citations, relevance screening, abstracts via CrossRef, author h-index via OpenAlex, OA PDFs via Unpaywall"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

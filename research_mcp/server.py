@@ -26,6 +26,27 @@ MAX_COUNT = 25
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 4
 
+# OpenAlex accepts at most 50 values in a single OR-filter (a|b|c).
+OPENALEX_MAX_BATCH = 50
+
+# Small stop-list for the lexical overlap signal in assess_relevance. Deliberately
+# short: it only needs to strip filler so the matched/missing terms stay readable.
+_STOPWORDS = frozenset("""
+a an and are as at be been being between both but by can could during each for
+from had has have here how if in into is it its may might more most no not of on
+or other others our over paper papers should such than that the their them then
+there these this those to under use used using was we were what when which who
+will with within without would you your study studies research article approach
+based new all any also
+""".split())
+
+_WORD_RE = re.compile(r"[a-z0-9][a-z0-9\-]*")
+_OPENALEX_ID_RE = re.compile(r"^W\d+$", re.IGNORECASE)
+
+# Fields needed to summarise a work; abstract/topics only where actually used.
+_SUMMARY_SELECT = "id,doi,display_name,publication_year,cited_by_count,primary_location"
+_RELEVANCE_SELECT = _SUMMARY_SELECT + ",abstract_inverted_index,topics,keywords"
+
 server = Server("research-mcp")
 
 # Latest Scopus rate-limit headers, refreshed on every Scopus call.
@@ -116,6 +137,107 @@ async def _scopus_get(endpoint: str, params: Optional[dict] = None) -> httpx.Res
     return r
 
 
+# ── OpenAlex helpers ──────────────────────────────────────────────────────────
+
+async def _openalex_get(path: str, params: Optional[dict] = None) -> httpx.Response:
+    """GET an OpenAlex endpoint, always identifying us for the polite pool."""
+    merged = {"mailto": UNPAYWALL_EMAIL}
+    if params:
+        merged.update(params)
+    return await _get_with_retry(http_client(), OPENALEX_BASE + path, params=merged)
+
+
+def _classify_identifier(identifier: str) -> tuple[str, str]:
+    """Classify a paper identifier as ('openalex' | 'doi' | 'scopus' | 'unknown', value)."""
+    ident = (identifier or "").strip()
+    for prefix in ("https://openalex.org/", "https://doi.org/", "http://dx.doi.org/", "doi:"):
+        if ident.lower().startswith(prefix):
+            ident = ident[len(prefix):]
+            break
+    if ident.upper().startswith("SCOPUS_ID:"):
+        ident = ident.split(":", 1)[1]
+        return ("scopus", ident) if ident.isdigit() else ("unknown", ident)
+    if _OPENALEX_ID_RE.match(ident):
+        return "openalex", ident.upper()
+    if ident.startswith("10."):
+        return "doi", ident
+    if ident.isdigit():
+        return "scopus", ident
+    return "unknown", ident
+
+
+async def _openalex_ref(identifier: str) -> tuple[Optional[str], Optional[dict]]:
+    """Map any supported identifier onto an OpenAlex entity reference.
+
+    Returns (ref, error). `ref` is either a bare work ID ("W123") or "doi:10.x/y".
+    Scopus IDs cost one Scopus call to look the DOI up; DOIs are quota-free.
+    """
+    kind, value = _classify_identifier(identifier)
+    if kind == "scopus":
+        details = await get_abstract_details(value)
+        if details.get("error"):
+            return None, {"error": f"Could not resolve Scopus ID {value}: {details['error']}"}
+        doi = details.get("doi")
+        if not doi:
+            return None, {"error": f"Scopus document {value} has no DOI, so it cannot be matched in OpenAlex."}
+        kind, value = "doi", doi
+    if kind == "openalex":
+        return value, None
+    if kind == "doi":
+        return f"doi:{value}", None
+    return None, {
+        "error": f"Unrecognised identifier '{identifier}'. "
+                 "Provide a DOI, an OpenAlex work ID (W...), or a Scopus ID."
+    }
+
+
+def _reconstruct_abstract(inverted: Optional[dict]) -> Optional[str]:
+    """Rebuild plain text from OpenAlex's abstract_inverted_index ({term: [positions]})."""
+    if not inverted:
+        return None
+    positions: dict[int, str] = {}
+    for term, idxs in inverted.items():
+        for i in idxs or []:
+            positions[i] = term
+    return " ".join(positions[i] for i in sorted(positions)) or None
+
+
+def _work_summary(w: dict) -> dict:
+    oa_id = (w.get("id") or "").replace("https://openalex.org/", "")
+    return {
+        "openalex_id":    oa_id or None,
+        "doi":            (w.get("doi") or "").replace("https://doi.org/", "") or None,
+        "title":          w.get("display_name"),
+        "year":           w.get("publication_year"),
+        "venue":          ((w.get("primary_location") or {}).get("source") or {}).get("display_name"),
+        "cited_by_count": w.get("cited_by_count"),
+        "url":            f"https://openalex.org/{oa_id}" if oa_id else None,
+    }
+
+
+async def _openalex_batch(ids: list[str], select: str = _SUMMARY_SELECT) -> list[dict]:
+    """Hydrate OpenAlex work IDs, chunked to the OR-filter limit."""
+    out: list[dict] = []
+    for i in range(0, len(ids), OPENALEX_MAX_BATCH):
+        chunk = ids[i:i + OPENALEX_MAX_BATCH]
+        r = await _openalex_get("works", {
+            "filter": "openalex_id:" + "|".join(chunk),
+            "select": select,
+            "per-page": len(chunk),
+        })
+        if r.status_code != 200:
+            logger.warning("OpenAlex batch lookup failed: HTTP %s", r.status_code)
+            continue
+        out.extend(r.json().get("results", []))
+    return out
+
+
+def _content_terms(text: str) -> set[str]:
+    if not text:
+        return set()
+    return {w for w in _WORD_RE.findall(text.lower()) if len(w) > 2 and w not in _STOPWORDS}
+
+
 # ── Scopus Search ─────────────────────────────────────────────────────────────
 
 async def search_scopus(query: str, count: int = 5, sort: str = "coverDate") -> list[dict]:
@@ -195,15 +317,11 @@ async def get_abstract_details(scopus_id: str) -> dict:
 
 async def get_author_profile(author_name: str) -> dict:
     """Search OpenAlex for an author by name; return h-index and citation metrics."""
-    r = await _get_with_retry(
-        http_client(),
-        OPENALEX_BASE + "authors",
-        params={
-            "search": author_name,
-            "select": "id,display_name,cited_by_count,works_count,summary_stats,last_known_institutions,ids",
-            "per-page": 3,
-        },
-    )
+    r = await _openalex_get("authors", {
+        "search": author_name,
+        "select": "id,display_name,cited_by_count,works_count,summary_stats,last_known_institutions,ids",
+        "per-page": 3,
+    })
     if r.status_code != 200:
         return {"error": f"OpenAlex returned HTTP {r.status_code}"}
 
@@ -230,11 +348,217 @@ async def get_author_profile(author_name: str) -> dict:
     return {"matches": matches, "note": "Top 3 matches from OpenAlex — verify by name/affiliation."}
 
 
-# ── Citing papers ─────────────────────────────────────────────────────────────
+# ── Forward citations (papers citing this one) ────────────────────────────────
 
-async def get_citing_papers(scopus_id: str, count: int = 5, sort: str = "coverDate") -> list[dict]:
+async def _citing_openalex(identifier: str, count: int) -> dict:
+    ref, err = await _openalex_ref(identifier)
+    if err:
+        return err
+
+    # The cites: filter needs a bare work ID, so resolve a DOI reference first.
+    if ref.startswith("doi:"):
+        r = await _openalex_get(f"works/{ref}", {"select": "id"})
+        if r.status_code == 404:
+            return {"error": f"'{identifier}' not found in OpenAlex."}
+        if r.status_code != 200:
+            return {"error": f"OpenAlex returned HTTP {r.status_code}"}
+        ref = (r.json().get("id") or "").replace("https://openalex.org/", "")
+        if not ref:
+            return {"error": f"Could not resolve '{identifier}' to an OpenAlex work ID."}
+
+    r = await _openalex_get("works", {
+        "filter": f"cites:{ref}",
+        "select": _SUMMARY_SELECT,
+        "sort": "cited_by_count:desc",
+        "per-page": count,
+    })
+    if r.status_code != 200:
+        return {"error": f"OpenAlex returned HTTP {r.status_code}"}
+    data = r.json()
+    return {
+        "source_paper": {"openalex_id": ref},
+        "direction": "forward",
+        "total_citing": data.get("meta", {}).get("count"),
+        "citing_papers": [_work_summary(w) for w in data.get("results", [])],
+        "note": "Forward citations from OpenAlex (free, no Scopus quota), most-cited first.",
+    }
+
+
+async def get_citing_papers(
+    scopus_id: str, count: int = 5, sort: str = "coverDate", source: str = "scopus"
+) -> Any:
+    """Papers citing a document. source='scopus' (default) or 'openalex' (no quota, wider recall)."""
+    if str(source).lower() == "openalex":
+        return await _citing_openalex(scopus_id, _clamp_count(count))
     sid = scopus_id.replace("SCOPUS_ID:", "")
     return await search_scopus(f"REFEID({sid})", count=count, sort=sort)
+
+
+# ── Backward citations (papers this one cites) ────────────────────────────────
+
+async def _crossref_references(doi: str) -> list[dict]:
+    """Fallback reference list from CrossRef; entries are less structured than OpenAlex."""
+    try:
+        r = await _get_with_retry(http_client(), CROSSREF_BASE + doi)
+        if r.status_code != 200:
+            return []
+        refs = r.json().get("message", {}).get("reference") or []
+    except httpx.HTTPError as e:
+        logger.warning("CrossRef reference lookup failed: %s", e)
+        return []
+    return [{
+        "doi":    ref.get("DOI"),
+        "title":  ref.get("article-title") or ref.get("volume-title") or ref.get("unstructured"),
+        "year":   ref.get("year"),
+        "author": ref.get("author"),
+    } for ref in refs]
+
+
+async def get_references(identifier: str, count: int = 10) -> dict:
+    """Works cited BY the given paper (backward citations), via OpenAlex.
+
+    Scopus cannot serve this on a free key (view=REF returns 401), so OpenAlex is
+    the primary source, with CrossRef as a fallback.
+    """
+    n = _clamp_count(count)
+    ref, err = await _openalex_ref(identifier)
+    if err:
+        return err
+
+    r = await _openalex_get(f"works/{ref}", {"select": "id,doi,display_name,referenced_works"})
+    if r.status_code == 404:
+        return {"error": f"'{identifier}' not found in OpenAlex."}
+    if r.status_code != 200:
+        return {"error": f"OpenAlex returned HTTP {r.status_code}"}
+    work = r.json()
+
+    source_paper = {
+        "title": work.get("display_name"),
+        "doi": (work.get("doi") or "").replace("https://doi.org/", "") or None,
+    }
+    ref_ids = [w.replace("https://openalex.org/", "") for w in (work.get("referenced_works") or [])]
+
+    if not ref_ids:
+        fallback = await _crossref_references(source_paper["doi"]) if source_paper["doi"] else []
+        return {
+            "source_paper": source_paper,
+            "direction": "backward",
+            "total_references": len(fallback),
+            "references": fallback[:n],
+            "note": (
+                "OpenAlex holds no reference list for this work; entries came from CrossRef "
+                "and are less structured." if fallback else
+                "No reference list available from OpenAlex or CrossRef for this work."
+            ),
+        }
+
+    # Hydrate at most one batch, then surface the most-cited references first.
+    hydrated = await _openalex_batch(ref_ids[:OPENALEX_MAX_BATCH])
+    refs = sorted(
+        (_work_summary(w) for w in hydrated),
+        key=lambda x: x.get("cited_by_count") or 0,
+        reverse=True,
+    )
+    result = {
+        "source_paper": source_paper,
+        "direction": "backward",
+        "total_references": len(ref_ids),
+        "references": refs[:n],
+    }
+    if len(ref_ids) > OPENALEX_MAX_BATCH:
+        result["note"] = (
+            f"This work lists {len(ref_ids)} references; ranking considered the first "
+            f"{OPENALEX_MAX_BATCH} and returned the most-cited of those."
+        )
+    return result
+
+
+# ── Relevance evidence ────────────────────────────────────────────────────────
+
+async def assess_relevance(identifiers: Any, research_context: str) -> dict:
+    """Gather structured evidence for judging whether papers fit a research context.
+
+    Deliberately returns NO verdict: the calling model decides. The server's job is
+    to supply the abstract, topical metadata and term overlap needed to decide well,
+    for many papers in a single round-trip.
+    """
+    if isinstance(identifiers, str):
+        identifiers = [identifiers]
+    idents = [str(i).strip() for i in (identifiers or []) if str(i).strip()][:MAX_COUNT]
+    if not idents:
+        return {"error": "Provide at least one identifier (DOI, OpenAlex ID or Scopus ID)."}
+    if not (research_context or "").strip():
+        return {"error": "research_context must describe what you are looking for."}
+
+    dois: list[str] = []
+    oa_ids: list[str] = []
+    unresolved: list[dict] = []
+    for ident in idents:
+        ref, err = await _openalex_ref(ident)
+        if err:
+            unresolved.append({"identifier": ident, "error": err["error"]})
+        elif ref.startswith("doi:"):
+            dois.append(ref[4:])
+        else:
+            oa_ids.append(ref)
+
+    works: list[dict] = []
+    if oa_ids:
+        works.extend(await _openalex_batch(oa_ids, select=_RELEVANCE_SELECT))
+    for i in range(0, len(dois), OPENALEX_MAX_BATCH):
+        chunk = dois[i:i + OPENALEX_MAX_BATCH]
+        r = await _openalex_get("works", {
+            "filter": "doi:" + "|".join(chunk),
+            "select": _RELEVANCE_SELECT,
+            "per-page": len(chunk),
+        })
+        if r.status_code == 200:
+            works.extend(r.json().get("results", []))
+        else:
+            logger.warning("OpenAlex DOI batch failed: HTTP %s", r.status_code)
+
+    context_terms = _content_terms(research_context)
+    papers = []
+    for w in works:
+        paper = _work_summary(w)
+        abstract = _reconstruct_abstract(w.get("abstract_inverted_index"))
+        topics = [{"name": t.get("display_name"), "score": round(t.get("score") or 0, 2)}
+                  for t in (w.get("topics") or [])[:4]]
+        keywords = [{"name": k.get("display_name"), "score": round(k.get("score") or 0, 2)}
+                    for k in (w.get("keywords") or [])[:8]]
+        haystack = " ".join([
+            paper.get("title") or "",
+            abstract or "",
+            " ".join(t["name"] or "" for t in topics),
+            " ".join(k["name"] or "" for k in keywords),
+        ])
+        matched = sorted(context_terms & _content_terms(haystack))
+        missing = sorted(context_terms - _content_terms(haystack))
+        paper.update({
+            "abstract": abstract or "(no abstract available in OpenAlex)",
+            "topics": topics,
+            "keywords": keywords,
+            "lexical_overlap": {
+                "matched_terms": matched[:25],
+                "missing_terms": missing[:25],
+                "coverage": round(len(matched) / len(context_terms), 2) if context_terms else None,
+            },
+        })
+        papers.append(paper)
+
+    out: dict[str, Any] = {
+        "research_context": research_context,
+        "papers": papers,
+        "note": (
+            "No relevance verdict is computed server-side — judge each paper yourself from its "
+            "abstract, topics and keywords against the research context. 'lexical_overlap' is a "
+            "raw word-match signal that ignores synonyms and meaning: treat it as weak supporting "
+            "evidence, never as a relevance score."
+        ),
+    }
+    if unresolved:
+        out["unresolved"] = unresolved
+    return out
 
 
 # ── PDF link via Unpaywall ────────────────────────────────────────────────────
@@ -288,6 +612,11 @@ def get_quota_status() -> dict:
 
 _COUNT_SCHEMA = {"type": "integer", "description": f"Results to return (default 5, max {MAX_COUNT}).", "default": 5, "maximum": MAX_COUNT}
 _SORT_SCHEMA = {"type": "string", "description": "Sort by 'coverDate' or 'relevancy'.", "default": "coverDate"}
+_IDENTIFIER_SCHEMA = {
+    "type": "string",
+    "description": "Paper identifier: a DOI (preferred — free, no Scopus quota), an OpenAlex work ID "
+                   "(e.g. \"W2156435103\"), or a Scopus ID (costs one Scopus call to resolve the DOI).",
+}
 
 
 @server.list_tools()
@@ -326,15 +655,74 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_citing_papers",
-            description="Retrieve papers that cite a given Scopus document (forward citations).",
+            description=(
+                "Forward citations: papers that CITE a given document. source='scopus' (default) uses "
+                "the Scopus search endpoint and consumes quota; source='openalex' is free, needs no "
+                "quota and generally has much wider coverage."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "scopus_id": {"type": "string", "description": "Scopus ID of the document."},
+                    "scopus_id": {
+                        "type": "string",
+                        "description": "Scopus ID of the document. With source='openalex' a DOI or "
+                                       "OpenAlex work ID is also accepted.",
+                    },
                     "count": _COUNT_SCHEMA,
                     "sort": _SORT_SCHEMA,
+                    "source": {
+                        "type": "string",
+                        "enum": ["scopus", "openalex"],
+                        "description": "Which database to query. Default 'scopus'.",
+                        "default": "scopus",
+                    },
                 },
                 "required": ["scopus_id"],
+            },
+        ),
+        types.Tool(
+            name="get_references",
+            description=(
+                "Backward citations: the works a given paper CITES (its reference list), via OpenAlex "
+                "with a CrossRef fallback. Free and does not consume Scopus quota — Scopus itself "
+                "cannot serve reference lists without an institutional subscription. Returns the "
+                "most-cited references first."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "identifier": _IDENTIFIER_SCHEMA,
+                    "count": {"type": "integer", "description": f"References to return (default 10, max {MAX_COUNT}).", "default": 10, "maximum": MAX_COUNT},
+                },
+                "required": ["identifier"],
+            },
+        ),
+        types.Tool(
+            name="assess_relevance",
+            description=(
+                "Screen one or more papers against a research context. Returns, per paper, the "
+                "abstract (from OpenAlex — broader coverage than CrossRef), scored topics and "
+                "keywords, and which of your context's terms do and do not appear. Use it to triage "
+                "a whole search result set in one call, then judge relevance yourself: the server "
+                "deliberately returns evidence, not a verdict or score."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "identifiers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": f"Up to {MAX_COUNT} paper identifiers (DOI, OpenAlex ID or Scopus ID).",
+                        "maxItems": MAX_COUNT,
+                    },
+                    "research_context": {
+                        "type": "string",
+                        "description": "What you are looking for, e.g. \"psychological safety in "
+                                       "distributed software teams\". Be specific: the term-overlap "
+                                       "signal is computed from this text.",
+                    },
+                },
+                "required": ["identifiers", "research_context"],
             },
         ),
         types.Tool(
@@ -365,7 +753,18 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
         elif name == "get_author_profile":
             result = await get_author_profile(args["author_name"])
         elif name == "get_citing_papers":
-            result = await get_citing_papers(args["scopus_id"], count=args.get("count", 5), sort=args.get("sort", "coverDate"))
+            result = await get_citing_papers(
+                args.get("scopus_id") or args["identifier"],
+                count=args.get("count", 5),
+                sort=args.get("sort", "coverDate"),
+                source=args.get("source", "scopus"),
+            )
+        elif name == "get_references":
+            result = await get_references(
+                args.get("identifier") or args["scopus_id"], count=args.get("count", 10)
+            )
+        elif name == "assess_relevance":
+            result = await assess_relevance(args["identifiers"], args["research_context"])
         elif name == "get_pdf_link":
             result = await get_pdf_link(args["doi"])
         elif name == "get_quota_status":

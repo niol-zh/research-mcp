@@ -159,3 +159,172 @@ def test_quota_status_populated():
 @pytest.mark.parametrize("value,expected", [(0, 1), (5, 5), (25, 25), (999, 25), ("8", 8), (None, 5), ("x", 5)])
 def test_clamp_count(value, expected):
     assert server._clamp_count(value) == expected
+
+
+# ── identifier classification ─────────────────────────────────────────────────
+
+@pytest.mark.parametrize("value,expected", [
+    ("10.2307/2666999", ("doi", "10.2307/2666999")),
+    ("https://doi.org/10.2307/2666999", ("doi", "10.2307/2666999")),
+    ("doi:10.2307/2666999", ("doi", "10.2307/2666999")),
+    ("W2156435103", ("openalex", "W2156435103")),
+    ("w2156435103", ("openalex", "W2156435103")),
+    ("https://openalex.org/W2156435103", ("openalex", "W2156435103")),
+    ("85012345678", ("scopus", "85012345678")),
+    ("SCOPUS_ID:85012345678", ("scopus", "85012345678")),
+    ("nonsense", ("unknown", "nonsense")),
+])
+def test_classify_identifier(value, expected):
+    assert server._classify_identifier(value) == expected
+
+
+# ── abstract inverted index ───────────────────────────────────────────────────
+
+def test_reconstruct_abstract_orders_by_position():
+    inverted = {"learning": [2], "Team": [0], "matters": [3], "safety": [1]}
+    assert server._reconstruct_abstract(inverted) == "Team safety learning matters"
+
+
+@pytest.mark.parametrize("value", [None, {}])
+def test_reconstruct_abstract_empty(value):
+    assert server._reconstruct_abstract(value) is None
+
+
+# ── get_references (backward citations) ───────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_references_hydrates_and_sorts(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "works/doi:" in url:
+            return httpx.Response(200, json={
+                "id": "https://openalex.org/W1",
+                "doi": "https://doi.org/10.1/x",
+                "display_name": "Source paper",
+                "referenced_works": ["https://openalex.org/W10", "https://openalex.org/W11"],
+            })
+        # batch hydration
+        assert "openalex_id:W10|W11" in request.url.params.get("filter")
+        return httpx.Response(200, json={"results": [
+            {"id": "https://openalex.org/W10", "display_name": "Less cited",
+             "publication_year": 2001, "cited_by_count": 5},
+            {"id": "https://openalex.org/W11", "display_name": "Most cited",
+             "publication_year": 1999, "cited_by_count": 900},
+        ]})
+
+    monkeypatch.setattr(server, "http_client", lambda: _client(handler))
+    out = await server.get_references("10.1/x")
+    assert out["direction"] == "backward"
+    assert out["total_references"] == 2
+    # most-cited reference first
+    assert [r["title"] for r in out["references"]] == ["Most cited", "Less cited"]
+    assert out["source_paper"]["doi"] == "10.1/x"
+
+
+@pytest.mark.asyncio
+async def test_get_references_falls_back_to_crossref(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "openalex" in url:
+            return httpx.Response(200, json={
+                "id": "https://openalex.org/W1",
+                "doi": "https://doi.org/10.1/x",
+                "display_name": "Source paper",
+                "referenced_works": [],
+            })
+        assert "api.crossref.org" in url
+        return httpx.Response(200, json={"message": {"reference": [
+            {"DOI": "10.1/ref", "article-title": "A cited work", "year": "1990"},
+        ]}})
+
+    monkeypatch.setattr(server, "http_client", lambda: _client(handler))
+    out = await server.get_references("10.1/x")
+    assert out["references"][0]["doi"] == "10.1/ref"
+    assert "CrossRef" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_get_references_rejects_bad_identifier(monkeypatch):
+    monkeypatch.setattr(server, "http_client", lambda: _client(lambda r: httpx.Response(200, json={})))
+    out = await server.get_references("not-an-id")
+    assert "Unrecognised identifier" in out["error"]
+
+
+# ── forward citations via OpenAlex ────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_citing_papers_openalex(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "cites:" in (request.url.params.get("filter") or ""):
+            assert request.url.params.get("filter") == "cites:W2156435103"
+            return httpx.Response(200, json={
+                "meta": {"count": 10892},
+                "results": [{"id": "https://openalex.org/W99", "display_name": "Citing work",
+                             "publication_year": 2010, "cited_by_count": 3786}],
+            })
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    monkeypatch.setattr(server, "http_client", lambda: _client(handler))
+    out = await server.get_citing_papers("W2156435103", source="openalex")
+    assert out["direction"] == "forward"
+    assert out["total_citing"] == 10892
+    assert out["citing_papers"][0]["title"] == "Citing work"
+
+
+@pytest.mark.asyncio
+async def test_get_citing_papers_defaults_to_scopus(monkeypatch):
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["query"] = request.url.params.get("query")
+        return httpx.Response(200, json={"search-results": {"entry": []}})
+
+    monkeypatch.setattr(server, "scopus_client", lambda: _client(handler))
+    await server.get_citing_papers("12345")
+    assert captured["query"] == "REFEID(12345)"
+
+
+# ── assess_relevance ──────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_assess_relevance_builds_evidence(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "doi:10.1/x" in (request.url.params.get("filter") or "")
+        return httpx.Response(200, json={"results": [{
+            "id": "https://openalex.org/W1",
+            "doi": "https://doi.org/10.1/x",
+            "display_name": "Psychological safety in teams",
+            "publication_year": 1999,
+            "cited_by_count": 11007,
+            "abstract_inverted_index": {"Teams": [0], "learn": [1], "safely": [2]},
+            "topics": [{"display_name": "Team Dynamics", "score": 0.98}],
+            "keywords": [{"display_name": "Psychological safety", "score": 0.9}],
+        }]})
+
+    monkeypatch.setattr(server, "http_client", lambda: _client(handler))
+    out = await server.assess_relevance(["10.1/x"], "psychological safety in teams")
+    paper = out["papers"][0]
+    assert paper["abstract"] == "Teams learn safely"
+    assert paper["topics"][0]["name"] == "Team Dynamics"
+    overlap = paper["lexical_overlap"]
+    assert "safety" in overlap["matched_terms"]
+    assert "teams" in overlap["matched_terms"]
+    # no server-side verdict is ever produced
+    assert "verdict" not in paper and "score" not in paper
+    assert "never as a relevance score" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_assess_relevance_reports_unresolved(monkeypatch):
+    def handler(request):
+        return httpx.Response(200, json={"results": []})
+
+    monkeypatch.setattr(server, "http_client", lambda: _client(handler))
+    out = await server.assess_relevance(["bogus-id"], "some context")
+    assert out["unresolved"][0]["identifier"] == "bogus-id"
+
+
+@pytest.mark.asyncio
+async def test_assess_relevance_validates_input():
+    assert "at least one identifier" in (await server.assess_relevance([], "ctx"))["error"]
+    assert "research_context" in (await server.assess_relevance(["10.1/x"], "  "))["error"]

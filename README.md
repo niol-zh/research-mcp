@@ -15,9 +15,36 @@ Scopus entitlements.
 | `search_scopus` | Elsevier Scopus | Documents matching a query (title, DOI, citations, …) |
 | `get_abstract_details` | Scopus + [CrossRef](https://www.crossref.org) | Metadata + abstract text |
 | `get_author_profile` | [OpenAlex](https://openalex.org) | h-index, citation count, paper count, affiliations, ORCID |
-| `get_citing_papers` | Elsevier Scopus | Papers that cite a given document (forward citations) |
+| `get_citing_papers` | Scopus **or** OpenAlex | Papers that cite a given document (**forward** citations) |
+| `get_references` | OpenAlex + CrossRef | Papers cited **by** a given document (**backward** citations) |
+| `assess_relevance` | OpenAlex | Abstract, topics, keywords and term overlap for screening papers against a research context |
 | `get_pdf_link` | [Unpaywall](https://unpaywall.org) | Open-access PDF link for a DOI |
 | `get_quota_status` | — | Reminder about Scopus API quota |
+
+### Citation traversal in both directions
+
+`get_citing_papers` (forward) and `get_references` (backward) let you walk a
+citation graph from any starting paper. Backward citations **must** come from
+OpenAlex: the Scopus reference view (`view=REF`) returns `401
+AUTHORIZATION_ERROR` without an institutional subscription. OpenAlex also serves
+forward citations for free with much wider recall than the Scopus search
+endpoint — pass `source="openalex"` to `get_citing_papers` to use it and spend no
+quota.
+
+### Screening papers for relevance
+
+`assess_relevance` takes a list of papers and a plain-language research context,
+and returns the evidence needed to judge each one: the abstract (from OpenAlex,
+which covers far more papers than CrossRef), scored topics and keywords, and
+which of your context's terms appear or are missing.
+
+It screens up to 25 papers **in a single call**, so a whole `search_scopus`
+result set can be triaged in one turn instead of one lookup per paper.
+
+> **It deliberately returns no verdict and no relevance score.** The server has no
+> language model; the judgement is left to the model calling the tool, which reads
+> the abstract itself. The `lexical_overlap` field is a raw word-match signal that
+> ignores synonyms and meaning — useful supporting evidence, not a ranking.
 
 ### Why the extra APIs?
 
@@ -73,8 +100,11 @@ The Scopus tools need an Elsevier Developer API key. It's free to register.
 | Capability | Free key | Notes |
 |------------|:--------:|-------|
 | `search_scopus` | ✅ | Up to ~20,000 requests/week |
-| `get_citing_papers` | ✅ | Uses the search endpoint |
+| `get_citing_papers` | ✅ | Uses the search endpoint; `source="openalex"` costs no quota |
+| `get_references` | ✅ | Uses OpenAlex/CrossRef, not Scopus — no quota at all |
+| `assess_relevance` | ✅ | Uses OpenAlex — no quota (unless you pass Scopus IDs) |
 | Scopus full abstract (`view=FULL`) | ❌ | Needs institutional subscription → this server falls back to **CrossRef** |
+| Scopus reference list (`view=REF`) | ❌ | Needs institutional subscription → `get_references` uses **OpenAlex** |
 | Scopus author retrieval | ❌ | Needs institutional subscription → this server uses **OpenAlex** |
 
 ### Unlocking full Scopus data (optional)
@@ -305,11 +335,45 @@ on HTTP 429, quota tracking and error paths.
 | `author_name` | string | Author's full name, e.g. `Amy Edmondson`. Returns the top 3 OpenAlex matches — verify by name/affiliation. |
 
 ### `get_citing_papers`
+Forward citations — papers that **cite** the given document.
+
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `scopus_id` | string | — | Scopus document ID |
+| `scopus_id` | string | — | Scopus document ID. With `source="openalex"`, a DOI or OpenAlex ID also works |
 | `count` | int | 5 | Results to return (max 25) |
-| `sort` | string | `coverDate` | `coverDate` or `relevancy` |
+| `sort` | string | `coverDate` | `coverDate` or `relevancy` (Scopus only) |
+| `source` | string | `scopus` | `scopus` (uses quota) or `openalex` (free, wider recall, most-cited first) |
+
+### `get_references`
+Backward citations — papers **cited by** the given document, most-cited first.
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `identifier` | string | — | DOI, OpenAlex work ID (`W…`) or Scopus ID |
+| `count` | int | 10 | References to return (max 25) |
+
+Reference lists come from OpenAlex, falling back to CrossRef when OpenAlex has
+none. For works with more than 50 references, ranking considers the first 50;
+`total_references` always reports the true count.
+
+### `assess_relevance`
+Evidence for screening papers against a research context — **no verdict, no score**.
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `identifiers` | string[] | Up to 25 papers (DOI, OpenAlex ID or Scopus ID) |
+| `research_context` | string | What you are looking for, e.g. `psychological safety in distributed software teams` |
+
+Returns per paper: title, DOI, year, venue, citation count, abstract, scored
+topics and keywords, and `lexical_overlap` (`matched_terms`, `missing_terms`,
+`coverage`). Identifiers that cannot be resolved are reported under
+`unresolved` rather than silently dropped.
+
+#### Identifiers
+
+`get_references` and `assess_relevance` accept a **DOI** (preferred — free), an
+**OpenAlex work ID**, or a **Scopus ID**. A Scopus ID costs one Scopus call to
+resolve its DOI first, so pass DOIs when you have them.
 
 ### `get_pdf_link`
 | Param | Type | Description |
