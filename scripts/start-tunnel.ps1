@@ -29,6 +29,10 @@ foreach ($cmd in @("uvx", "cloudflared")) {
 
 Write-Host "Starting research-mcp on port $Port ..." -ForegroundColor Cyan
 $server = Start-Process uvx -PassThru -ArgumentList @(
+    # Pin mcp below 2.0.0 here too. uvx resolves mcp-proxy in its own isolated
+    # environment, so the cap in pyproject.toml does not apply: it would pull
+    # mcp 2.x, which no longer exports request_ctx and breaks mcp-proxy on import.
+    "--with", "mcp<2",
     "mcp-proxy", "--port", "$Port", "--transport", "streamablehttp",
     "-e", "SCOPUS_API_KEY", "$env:SCOPUS_API_KEY",
     "-e", "UNPAYWALL_EMAIL", "$env:UNPAYWALL_EMAIL",
