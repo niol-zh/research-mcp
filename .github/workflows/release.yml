@@ -1,0 +1,70 @@
+name: Release
+
+# Manual release: creates the git tag and the GitHub release in one step.
+# Tag pushes are the only thing this needs elevated rights for, so the work
+# happens here rather than from a developer machine.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create, e.g. v0.5.1"
+        required: true
+        type: string
+      target:
+        description: "Commit SHA to tag (defaults to the head of the selected branch)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Inputs are passed through the environment, never interpolated into the
+      # shell, so a crafted tag cannot inject commands.
+      - name: Resolve target commit
+        id: resolve
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          sha="${TARGET:-$GITHUB_SHA}"
+          if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+            echo "::error::Target commit $sha does not exist in this repository."
+            exit 1
+          fi
+          echo "sha=$(git rev-parse "$sha")" >> "$GITHUB_OUTPUT"
+
+      - name: Check tag matches the packaged version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          want="${TAG#v}"
+          have="$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)"
+          if [ "$want" != "$have" ]; then
+            echo "::error::Tag $TAG implies version $want but pyproject.toml says $have."
+            exit 1
+          fi
+          echo "Version check passed: $have"
+
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          notes="docs/releases/${TAG}.md"
+          args=(release create "$TAG" --target "$SHA" --title "research-mcp $TAG")
+          if [ -f "$notes" ]; then
+            echo "Using release notes from $notes"
+            args+=(--notes-file "$notes")
+          else
+            echo "No $notes found; generating notes from commit history."
+            args+=(--generate-notes)
+          fi
+          gh "${args[@]}"
