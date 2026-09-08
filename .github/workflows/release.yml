@@ -40,6 +40,13 @@ jobs:
           fi
           echo "sha=$(git rev-parse "$sha")" >> "$GITHUB_OUTPUT"
 
+      # Everything below (version check, bundle build, release notes) must come
+      # from the commit being tagged, not from the branch head.
+      - name: Check out the target commit
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: git checkout --quiet "$SHA"
+
       - name: Check tag matches the packaged version
         env:
           TAG: ${{ inputs.tag }}
@@ -50,7 +57,36 @@ jobs:
             echo "::error::Tag $TAG implies version $want but pyproject.toml says $have."
             exit 1
           fi
+          bundle="$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')"
+          if [ "$want" != "$bundle" ]; then
+            echo "::error::Tag $TAG implies version $want but manifest.json says $bundle."
+            exit 1
+          fi
           echo "Version check passed: $have"
+
+      # The Claude Desktop extension (.mcpb) is a zip of manifest.json,
+      # pyproject.toml, uv.lock and the package. Dependencies are not vendored:
+      # the uv server type lets Claude Desktop install them on first start, and
+      # the lockfile pins what it installs.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Lock dependencies for the bundle
+        run: uv lock
+
+      - name: Set up Node.js (for the mcpb CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build the Claude Desktop extension
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p dist
+          npx --yes @anthropic-ai/mcpb@2 validate manifest.json
+          npx --yes @anthropic-ai/mcpb@2 pack . "dist/research-mcp-${TAG}.mcpb"
+          npx --yes @anthropic-ai/mcpb@2 info "dist/research-mcp-${TAG}.mcpb"
 
       - name: Create tag and release
         env:
@@ -67,4 +103,6 @@ jobs:
             echo "No $notes found; generating notes from commit history."
             args+=(--generate-notes)
           fi
+          # Attach the extension bundle as a release asset.
+          args+=("dist/research-mcp-${TAG}.mcpb")
           gh "${args[@]}"
