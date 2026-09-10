@@ -23,3 +23,10 @@ Thumbs.db
 # Editors
 .vscode/
 .idea/
+
+# MCPB bundles are build output, produced by the release workflow
+*.mcpb
+
+# Scimago fallback table: ~5 MB, yearly, CC BY-NC — fetched, not committed.
+# See research_mcp/data/README.md
+research_mcp/data/scimago.csv

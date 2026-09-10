@@ -26,6 +26,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       # Inputs are passed through the environment, never interpolated into the
       # shell, so a crafted tag cannot inject commands.
       - name: Resolve target commit
@@ -50,7 +54,29 @@ jobs:
             echo "::error::Tag $TAG implies version $want but pyproject.toml says $have."
             exit 1
           fi
+          # The version also lives in manifest.json. Checking both here is what
+          # stops the two from drifting apart across releases.
+          if [ -f manifest.json ]; then
+            mani="$(jq -r '.version' manifest.json)"
+            if [ "$want" != "$mani" ]; then
+              echo "::error::Tag $TAG implies version $want but manifest.json says $mani."
+              exit 1
+            fi
+          fi
           echo "Version check passed: $have"
+
+      - name: Build the MCPB bundle
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [ ! -f manifest.json ]; then
+            echo "No manifest.json — skipping bundle build."
+            exit 0
+          fi
+          npm install -g @anthropic-ai/mcpb
+          mcpb validate manifest.json
+          mcpb pack . "research-mcp-${TAG}.mcpb"
+          ls -la research-mcp-*.mcpb
 
       - name: Create tag and release
         env:
@@ -67,4 +93,9 @@ jobs:
             echo "No $notes found; generating notes from commit history."
             args+=(--generate-notes)
           fi
+          # Attach the bundle when one was built, so the release page offers a
+          # one-click install alongside the source.
+          for f in research-mcp-*.mcpb; do
+            [ -f "$f" ] && args+=("$f")
+          done
           gh "${args[@]}"
