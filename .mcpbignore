@@ -1,0 +1,15 @@
+# Keep the bundle to what the server actually needs at runtime.
+.git/
+.github/
+.venv/
+venv/
+tests/
+docs/
+scripts/
+__pycache__/
+*.pyc
+*.mcpb
+dist/
+build/
+*.egg-info/
+.pytest_cache/

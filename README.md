@@ -110,6 +110,7 @@ The Scopus tools need an Elsevier Developer API key. It's free to register.
 | Scopus full abstract (`view=FULL`) | ❌ | Needs institutional subscription → this server falls back to **CrossRef** |
 | Scopus reference list (`view=REF`) | ❌ | Needs institutional subscription → `get_references` uses **OpenAlex** |
 | Scopus author retrieval | ❌ | Needs institutional subscription → this server uses **OpenAlex** |
+| `get_journal_metrics` | ⚠️ | Uses the Serial Title API, which is entitlement-gated. Without it the tool falls back to a local **Scimago** table |
 
 ### Unlocking full Scopus data (optional)
 
@@ -138,7 +139,23 @@ CrossRef, author metrics from OpenAlex, and PDFs from Unpaywall.
 
 ## Installation
 
-### Option A — Claude Code / Claude Desktop (recommended, no server needed)
+### Option A — One-click install (`.mcpb` bundle, recommended)
+
+Every [release](https://github.com/niol-zh/research-mcp/releases) ships a
+`research-mcp-vX.Y.Z.mcpb` bundle. Download it and double-click, or drag it into
+Claude Desktop's Settings window. Claude Code and MCP for Windows install it too.
+
+The bundle asks for your Scopus API key and contact email in a form — the key is
+stored masked, so there is no config file to hand-edit and no environment
+variable to set.
+
+It carries no Python dependencies: the bundle declares the `uv` runtime, and the
+host resolves `mcp` and `httpx` at first launch. That keeps it at ~23 KB and
+platform-independent — vendoring would not work here, because the MCP SDK depends
+on the compiled `pydantic-core`, which cannot be bundled portably across macOS,
+Windows and Linux.
+
+### Option B — Claude Code / Claude Desktop, configured by hand (no server needed)
 
 This is the simplest path. The server runs **locally as a stdio process** —
 [`uvx`](https://docs.astral.sh/uv/) fetches it straight from GitHub, so there is
@@ -187,7 +204,7 @@ If you've cloned the repo and want to run from disk:
 
 ---
 
-### Option B — Claude Cowork (remote connector, needs an HTTPS URL)
+### Option C — Claude Cowork (remote connector, needs an HTTPS URL)
 
 Cowork runs in an isolated cloud VM and **cannot reach a local stdio process**.
 It needs the server exposed over **HTTPS using the Streamable HTTP transport**.
@@ -215,7 +232,10 @@ You need two pieces running on your machine:
 export SCOPUS_API_KEY="your-scopus-api-key"
 export UNPAYWALL_EMAIL="you@example.com"
 
-uvx mcp-proxy --port 8000 --transport streamablehttp \
+# --with "mcp<2": uvx resolves mcp-proxy in its own environment, so the cap in
+# pyproject.toml does not reach it. Without the pin it pulls mcp 2.x, which no
+# longer exports request_ctx, and mcp-proxy dies on import.
+uvx --with "mcp<2" mcp-proxy --port 8000 --transport streamablehttp \
   -e SCOPUS_API_KEY "$SCOPUS_API_KEY" \
   -- uvx --from git+https://github.com/niol-zh/research-mcp research-mcp
 ```
@@ -328,6 +348,9 @@ on HTTP 429, quota tracking and error paths.
 | `count` | int | 5 | Results to return (max 25) |
 | `sort` | string | `coverDate` | `coverDate` or `relevancy` |
 
+Each result carries `issn` and `e_issn`, which feed straight into
+[`get_journal_metrics`](#get_journal_metrics).
+
 ### `get_abstract_details`
 | Param | Type | Description |
 |-------|------|-------------|
@@ -390,6 +413,26 @@ resolve its DOI first, so pass DOIs when you have them.
 | Param | Type | Description |
 |-------|------|-------------|
 | `doi` | string | DOI, e.g. `10.1016/j.tourman.2026.105478` |
+
+### `get_journal_metrics`
+| Param | Type | Description |
+|-------|------|-------------|
+| `issn` | string | Journal ISSN, with or without the hyphen, e.g. `0001-8392` |
+
+Returns the **quartile (Q1–Q4) per subject category**, plus CiteScore, SJR and
+SNIP. A journal usually sits in several categories with *different* quartiles, so
+`subject_areas` is a list; `best_quartile` gives the strongest one, which is what
+papers normally cite.
+
+The `source` field says where the numbers came from — `scopus` from the live
+Serial Title API, `scimago` from the local fallback table. The two differ
+slightly, so it is worth reporting which one you used.
+
+The Serial Title API needs an entitlement many keys lack. When it is
+unavailable the tool falls back to a Scimago table you place at
+`research_mcp/data/scimago.csv` — see
+[that directory's README](research_mcp/data/README.md) for how to obtain it. The
+Scimago data is licensed **CC BY-NC**.
 
 ## Scopus query syntax (quick reference)
 

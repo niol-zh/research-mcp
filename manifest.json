@@ -1,0 +1,66 @@
+{
+  "manifest_version": "0.4",
+  "name": "research-mcp",
+  "display_name": "Research MCP",
+  "version": "0.6.0",
+  "description": "Academic literature research: Scopus search, citations, journal quartiles and open-access PDFs.",
+  "long_description": "Combines Scopus search with free, open scholarly APIs so you get abstracts, author metrics, citation networks, journal quartiles and open-access PDFs without needing institutional Scopus entitlements. Forward citations and reference lists come from OpenAlex, abstracts from CrossRef, open-access PDFs from Unpaywall.",
+  "author": {
+    "name": "Olivier Niklaus",
+    "url": "https://github.com/niol-zh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/niol-zh/research-mcp"
+  },
+  "homepage": "https://github.com/niol-zh/research-mcp",
+  "documentation": "https://github.com/niol-zh/research-mcp#readme",
+  "support": "https://github.com/niol-zh/research-mcp/issues",
+  "license": "MIT",
+  "keywords": ["research", "scopus", "openalex", "citations", "academic", "bibliometrics"],
+  "server": {
+    "type": "uv",
+    "entry_point": "research_mcp/server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "research-mcp"],
+      "env": {
+        "SCOPUS_API_KEY": "${user_config.scopus_api_key}",
+        "UNPAYWALL_EMAIL": "${user_config.unpaywall_email}"
+      }
+    }
+  },
+  "user_config": {
+    "scopus_api_key": {
+      "type": "string",
+      "title": "Scopus API key",
+      "description": "Your Elsevier Scopus API key from dev.elsevier.com. Required for Scopus search and abstracts; the OpenAlex, CrossRef and Unpaywall tools work without it.",
+      "sensitive": true,
+      "required": true
+    },
+    "unpaywall_email": {
+      "type": "string",
+      "title": "Contact email",
+      "description": "A real email address. Unpaywall and OpenAlex require one for their polite pool and reject requests without it.",
+      "sensitive": false,
+      "required": true
+    }
+  },
+  "tools": [
+    {"name": "search_scopus", "description": "Search Scopus by query string."},
+    {"name": "get_abstract_details", "description": "Scopus metadata plus the abstract text from CrossRef."},
+    {"name": "get_author_profile", "description": "Author h-index, citations, ORCID and affiliations via OpenAlex."},
+    {"name": "get_citing_papers", "description": "Forward citations: papers that cite a given document."},
+    {"name": "get_references", "description": "Backward citations: the works a paper cites."},
+    {"name": "assess_relevance", "description": "Screen papers against a stated research context."},
+    {"name": "get_pdf_link", "description": "Find an open-access PDF by DOI via Unpaywall."},
+    {"name": "get_journal_metrics", "description": "Journal quartile, CiteScore, SJR and SNIP for an ISSN."},
+    {"name": "get_quota_status", "description": "Report the current Scopus rate-limit."}
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  }
+}
