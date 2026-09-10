@@ -1,0 +1,104 @@
+{
+  "manifest_version": "0.4",
+  "name": "research-mcp",
+  "display_name": "Research MCP",
+  "version": "0.6.0",
+  "description": "Academic literature research: Scopus search, forward/backward citations, relevance screening, abstracts, author metrics and open-access PDFs",
+  "long_description": "An MCP server for academic literature research. It combines a Scopus search with three free, open scholarly APIs (CrossRef, OpenAlex, Unpaywall) so you get abstracts, author metrics, citation graphs and open-access PDFs without institutional Scopus entitlements.\n\nYou need a free Scopus API key from https://dev.elsevier.com/apikey/manage. The server runs locally; your key never leaves your machine except in requests to Elsevier.",
+  "author": {
+    "name": "niol-zh",
+    "url": "https://github.com/niol-zh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/niol-zh/research-mcp"
+  },
+  "homepage": "https://github.com/niol-zh/research-mcp",
+  "documentation": "https://github.com/niol-zh/research-mcp#readme",
+  "support": "https://github.com/niol-zh/research-mcp/issues",
+  "license": "MIT",
+  "keywords": [
+    "research",
+    "scopus",
+    "openalex",
+    "crossref",
+    "unpaywall",
+    "citations",
+    "academic",
+    "literature"
+  ],
+  "server": {
+    "type": "uv",
+    "entry_point": "research_mcp/server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--python-preference",
+        "system",
+        "--directory",
+        "${__dirname}",
+        "research_mcp/server.py"
+      ],
+      "env": {
+        "SCOPUS_API_KEY": "${user_config.scopus_api_key}",
+        "UNPAYWALL_EMAIL": "${user_config.unpaywall_email}"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "search_scopus",
+      "description": "Search Scopus by query string; returns title, DOI, Scopus ID, citation count and journal per match."
+    },
+    {
+      "name": "get_abstract_details",
+      "description": "Scopus metadata for a document plus the abstract text from CrossRef."
+    },
+    {
+      "name": "get_author_profile",
+      "description": "Author h-index, citation count, paper count, ORCID and affiliations via OpenAlex."
+    },
+    {
+      "name": "get_citing_papers",
+      "description": "Forward citations: papers that cite a given document (OpenAlex by default, Scopus optional)."
+    },
+    {
+      "name": "get_references",
+      "description": "Backward citations: the works a paper cites, via OpenAlex with CrossRef fallback."
+    },
+    {
+      "name": "assess_relevance",
+      "description": "Screen up to 25 papers against a research context; returns abstracts, topics, keywords and term overlap."
+    },
+    {
+      "name": "get_pdf_link",
+      "description": "Open-access PDF link for a DOI via Unpaywall."
+    },
+    {
+      "name": "get_quota_status",
+      "description": "Scopus weekly rate-limit status from the most recent response headers."
+    }
+  ],
+  "user_config": {
+    "scopus_api_key": {
+      "type": "string",
+      "title": "Scopus API key",
+      "description": "Free key from https://dev.elsevier.com/apikey/manage (32 hex characters). Stored securely on this machine.",
+      "sensitive": true,
+      "required": true
+    },
+    "unpaywall_email": {
+      "type": "string",
+      "title": "Contact email",
+      "description": "Your own email address. Unpaywall rejects requests without one (get_pdf_link), and OpenAlex uses it for its polite pool.",
+      "required": true
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  }
+}

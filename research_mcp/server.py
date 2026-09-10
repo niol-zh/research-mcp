@@ -3,6 +3,7 @@ import json
 import os
 import logging
 import re
+import sys
 from typing import Any, Optional
 
 import httpx
@@ -20,7 +21,10 @@ UNPAYWALL_BASE = "https://api.unpaywall.org/v2/"
 
 # Unpaywall and OpenAlex ask for a contact email (their "polite pool").
 # Unpaywall *rejects* requests without a real address, so get_pdf_link needs this.
-UNPAYWALL_EMAIL = os.environ.get("UNPAYWALL_EMAIL", "research-mcp@example.com")
+# `or` rather than a default argument: a configuration UI (e.g. the Claude
+# Desktop extension dialog) may set the variable to an empty string, which must
+# fall back too.
+UNPAYWALL_EMAIL = os.environ.get("UNPAYWALL_EMAIL") or "research-mcp@example.com"
 
 MAX_COUNT = 25
 RETRY_STATUSES = {429, 500, 502, 503, 504}
@@ -822,7 +826,27 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
         return [types.TextContent(type="text", text=json.dumps({"error": "An internal error occurred; see server logs."}))]
 
 
+def _describe_interpreter() -> str:
+    """One line saying which Python runs this server and where it came from.
+
+    Logged at startup so a user can see in the MCP logs whether an existing
+    system Python was reused or uv downloaded a managed one.
+    """
+    version = ".".join(str(n) for n in sys.version_info[:3])
+    # uv runs the server inside a virtualenv, so sys.executable would only show
+    # that venv. base_prefix is the interpreter the venv was created from.
+    base = sys.base_prefix
+    normalized = base.replace("\\", "/")
+    managed_dir = (os.environ.get("UV_PYTHON_INSTALL_DIR") or "").replace("\\", "/")
+    if (managed_dir and normalized.startswith(managed_dir)) or "/uv/python/" in normalized:
+        origin = "downloaded by uv"
+    else:
+        origin = "already installed on this machine"
+    return f"Python {version} from {base} ({origin})"
+
+
 async def main():
+    logger.info("Starting research-mcp: %s", _describe_interpreter())
     try:
         async with stdio_server() as (r, w):
             await server.run(r, w, server.create_initialization_options())

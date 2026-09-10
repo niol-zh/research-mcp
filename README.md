@@ -65,8 +65,9 @@ richer data.
 
 ## Requirements
 
-- Python ≥ 3.10
 - A free Scopus API key — register at [dev.elsevier.com](https://dev.elsevier.com/apikey/manage)
+- Python ≥ 3.10 — **not needed for the Claude Desktop extension** (Option A
+  below); it reuses a Python that is already installed or fetches one itself
 - Dependencies: only `mcp` and `httpx`
 
 ## Getting an Elsevier (Scopus) API key
@@ -138,9 +139,50 @@ CrossRef, author metrics from OpenAlex, and PDFs from Unpaywall.
 
 ## Installation
 
-### Option A — Claude Code / Claude Desktop (recommended, no server needed)
+### Option A — Claude Desktop extension (`.mcpb`, easiest)
 
-This is the simplest path. The server runs **locally as a stdio process** —
+One file, no terminal, no config editing. Best for colleagues who just want the
+tools in Claude Desktop.
+
+1. Download `research-mcp-vX.Y.Z.mcpb` from the
+   [latest release](https://github.com/niol-zh/research-mcp/releases/latest).
+2. Double-click the file (or open it with Claude Desktop). Claude shows an
+   install dialog.
+3. Enter your **Scopus API key** and your **contact email** (for Unpaywall and
+   OpenAlex). The key is stored in your operating system's credential store,
+   not in a config file.
+4. Click *Install*. The tools appear in Claude Desktop right away.
+
+The extension is a small zip (~90 KB) with the server code and a dependency
+lockfile. **It does not bundle Python.** On first start, Claude Desktop uses
+[uv](https://docs.astral.sh/uv/) to set things up:
+
+- If a **Python ≥ 3.10 is already installed** on your machine, it is used as is
+  (the extension starts `uv` with `--python-preference system`, so an existing
+  installation always wins).
+- If none is found, or the installed one is older than 3.10, uv **downloads a
+  private Python** (~30 MB) once. Nothing on your machine is changed.
+- Either way uv installs `mcp` and `httpx` into an isolated environment.
+
+That first start can take up to a minute; later starts are instant. The server
+logs which Python it runs on (`Starting research-mcp: Python 3.x from …`); the
+line shows up in the extension's log in Claude Desktop's settings.
+
+**Updating:** download the `.mcpb` of a newer release and install it the same
+way; it replaces the previous version.
+
+> **Claude Cowork:** local extensions are only reachable from Cowork inside the
+> **Claude Desktop app**, not from Cowork on the web or mobile. If that does not
+> work for you, use Option C.
+
+**Building the bundle yourself** (for development) is described under
+[Development](#development).
+
+---
+
+### Option B — Claude Code / Claude Desktop config (stdio, no server needed)
+
+The server runs **locally as a stdio process** —
 [`uvx`](https://docs.astral.sh/uv/) fetches it straight from GitHub, so there is
 **no web server and no tunnel involved**.
 
@@ -187,9 +229,10 @@ If you've cloned the repo and want to run from disk:
 
 ---
 
-### Option B — Claude Cowork (remote connector, needs an HTTPS URL)
+### Option C — Claude Cowork (remote connector, needs an HTTPS URL)
 
-Cowork runs in an isolated cloud VM and **cannot reach a local stdio process**.
+Cowork on the web and mobile runs in an isolated cloud VM and **cannot reach a
+local stdio process**.
 It needs the server exposed over **HTTPS using the Streamable HTTP transport**.
 The easiest way is a free [Cloudflare Quick Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/).
 
@@ -315,7 +358,27 @@ pytest
 
 Tests live in [`tests/`](tests/) and mock every external API with
 `httpx.MockTransport`, covering result parsing, `count` clamping, retry/backoff
-on HTTP 429, quota tracking and error paths.
+on HTTP 429, quota tracking and error paths. `tests/test_manifest.py` keeps
+`manifest.json` in step with the server: same version as `pyproject.toml`, and
+every tool the server serves is listed.
+
+### Building the Claude Desktop extension
+
+The release workflow builds and attaches the `.mcpb` automatically when a
+release is created (Actions → Release → *Run workflow* with the tag). To build
+one locally you need Node.js for the `mcpb` CLI:
+
+```bash
+uv lock                                                  # pins the dependencies shipped in the bundle
+npx --yes @anthropic-ai/mcpb@2 validate manifest.json
+npx --yes @anthropic-ai/mcpb@2 pack . dist/research-mcp.mcpb
+```
+
+[`.mcpbignore`](.mcpbignore) keeps tests, scripts, docs and workflows out of
+the bundle. The bundle uses the manifest's `uv` server type, so it ships no
+dependencies; Claude Desktop installs them from `pyproject.toml` / `uv.lock`
+on first start. Bump the version in **both** `pyproject.toml` and
+`manifest.json` before a release; CI fails if they differ.
 
 ---
 

@@ -1,0 +1,37 @@
+# Files excluded from the Claude Desktop extension bundle (`mcpb pack`).
+# The bundle needs only manifest.json, pyproject.toml, uv.lock, LICENSE,
+# README.md and the research_mcp/ package. Everything else stays out.
+#
+# The uv server type requires that no vendored dependencies or virtualenvs are
+# shipped: the host installs them from pyproject.toml on first start.
+
+.git/
+.github/
+.gitignore
+.mcpbignore
+tests/
+scripts/
+docs/
+dist/
+build/
+
+# Python build and cache artifacts
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+.uv/
+server/lib/
+server/venv/
+
+# Secrets and editor state
+.env
+*.key
+config.json
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
