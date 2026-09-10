@@ -1,8 +1,10 @@
 import asyncio
+import csv
 import json
 import os
 import logging
 import re
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -28,6 +30,12 @@ MAX_ATTEMPTS = 4
 
 # OpenAlex accepts at most 50 values in a single OR-filter (a|b|c).
 OPENALEX_MAX_BATCH = 50
+
+# Scimago journal-rank table, used as a fallback when the Scopus key has no
+# Serial Title entitlement. Downloaded from https://www.scimagojr.com/journalrank.php
+# (semicolon-separated). The data is licensed CC BY-NC — attribute it if you
+# redistribute results. Module-level so tests can point it at a small fixture.
+SCIMAGO_CSV = Path(__file__).parent / "data" / "scimago.csv"
 
 # Small stop-list for the lexical overlap signal in assess_relevance. Deliberately
 # short: it only needs to strip filler so the matched/missing terms stay readable.
@@ -251,6 +259,8 @@ async def search_scopus(query: str, count: int = 5, sort: str = "coverDate") -> 
         "title":            e.get("dc:title"),
         "creator":          e.get("dc:creator"),
         "publication_name": e.get("prism:publicationName"),
+        "issn":             e.get("prism:issn"),
+        "e_issn":           e.get("prism:eIssn"),
         "cover_date":       e.get("prism:coverDate"),
         "doi":              e.get("prism:doi"),
         "cited_by_count":   e.get("citedby-count"),
@@ -303,6 +313,8 @@ async def get_abstract_details(scopus_id: str) -> dict:
         "title":            coredata.get("dc:title"),
         "abstract":         abstract or "(Abstract not available via CrossRef — may require institutional Scopus access)",
         "publication_name": coredata.get("prism:publicationName"),
+        "issn":             coredata.get("prism:issn"),
+        "e_issn":           coredata.get("prism:eIssn"),
         "cover_date":       coredata.get("prism:coverDate"),
         "cited_by_count":   coredata.get("citedby-count"),
         "volume":           coredata.get("prism:volume"),
@@ -630,6 +642,300 @@ async def get_pdf_link(doi: str) -> dict:
         return result
 
 
+# ── ISSN handling ─────────────────────────────────────────────────────────────
+
+_ISSN_CLEAN_RE = re.compile(r"[^0-9X]")
+
+
+def _normalise_issn(value: Any, strict: bool = True) -> Optional[str]:
+    """Normalise an ISSN to canonical ``NNNN-NNNC`` form, or None if invalid.
+
+    Deliberately separate from _classify_identifier: that function's isdigit()
+    branch reads a hyphen-less ISSN like "09565221" as a Scopus ID, so routing
+    ISSNs through it would silently misclassify them.
+
+    ``strict`` verifies the mod-11 check digit. Use it for user input; the
+    Scimago loader turns it off, since a bad check digit in a reference table
+    should not make the row unfindable.
+    """
+    raw = _ISSN_CLEAN_RE.sub("", str(value or "").upper())
+    if len(raw) != 8 or "X" in raw[:7]:
+        return None
+    if strict:
+        total = sum(int(d) * w for d, w in zip(raw[:7], range(8, 1, -1)))
+        check = (11 - total % 11) % 11
+        if raw[7] != ("X" if check == 10 else str(check)):
+            return None
+    return f"{raw[:4]}-{raw[4:]}"
+
+
+def _quartile_from_percentile(pct: Any) -> Optional[str]:
+    """Q1 is the top quarter of a subject category, Q4 the bottom."""
+    try:
+        p = float(pct)
+    except (TypeError, ValueError):
+        return None
+    if p >= 75:
+        return "Q1"
+    if p >= 50:
+        return "Q2"
+    if p >= 25:
+        return "Q3"
+    return "Q4"
+
+
+def _quartile_from_rank(rank: Any, total: Any) -> Optional[str]:
+    """Fallback when only rank-within-category is known, not a percentile."""
+    try:
+        r, n = int(rank), int(total)
+    except (TypeError, ValueError):
+        return None
+    if r < 1 or n < 1:
+        return None
+    return _quartile_from_percentile((n - r) / n * 100)
+
+
+def _best_quartile(areas: list[dict]) -> Optional[str]:
+    """The strongest quartile across all categories — what papers usually cite."""
+    found = [a["quartile"] for a in areas if a.get("quartile")]
+    return min(found) if found else None
+
+
+# ── Scimago fallback table ────────────────────────────────────────────────────
+
+_scimago_index: Optional[dict[str, dict]] = None
+_SCIMAGO_CATEGORY_RE = re.compile(r"^(.*?)\s*\(Q([1-4])\)$")
+
+
+def _scimago_float(value: Any) -> Optional[float]:
+    """Scimago writes decimals with a comma (\"5,123\")."""
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_scimago() -> dict[str, dict]:
+    """Index the Scimago table by normalised ISSN.
+
+    Loaded on first use rather than at import: parsing ~30k rows should not be
+    part of every server start, and most sessions never hit the fallback.
+    """
+    global _scimago_index
+    if _scimago_index is not None:
+        return _scimago_index
+
+    index: dict[str, dict] = {}
+    try:
+        with open(SCIMAGO_CSV, newline="", encoding="utf-8-sig") as fh:
+            reader = csv.DictReader(fh, delimiter=";", restkey="_overflow")
+            for row in reader:
+                # The file is semicolon-separated, yet its own Categories column
+                # uses "; " between categories. Quoted exports survive that;
+                # unquoted ones spill into extra positional fields. Stitch those
+                # back onto the last column instead of losing every category but
+                # the first.
+                overflow = row.pop("_overflow", None)
+                if overflow and reader.fieldnames:
+                    last = reader.fieldnames[-1]
+                    row[last] = "; ".join(
+                        [row.get(last) or ""] + [c for c in overflow if c]
+                    ).strip("; ")
+                # The Issn column holds hyphen-less ISSNs, comma-separated when a
+                # journal has both a print and an electronic one.
+                for part in (row.get("Issn") or "").split(","):
+                    issn = _normalise_issn(part, strict=False)
+                    if issn:
+                        index[issn] = row
+    except FileNotFoundError:
+        logger.warning("Scimago table not found at %s — fallback unavailable.", SCIMAGO_CSV)
+    except (OSError, csv.Error) as e:
+        logger.warning("Could not read the Scimago table: %s", e)
+
+    _scimago_index = index
+    return index
+
+
+def _scimago_journal_metrics(issn: str) -> Optional[dict]:
+    """Look the journal up in the bundled Scimago table."""
+    row = _load_scimago().get(issn)
+    if not row:
+        return None
+
+    areas: list[dict] = []
+    for chunk in (row.get("Categories") or "").split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        m = _SCIMAGO_CATEGORY_RE.match(chunk)
+        if m:
+            areas.append({"category": m.group(1), "quartile": f"Q{m.group(2)}"})
+        else:
+            areas.append({"category": chunk, "quartile": None})
+
+    return {
+        "issn": issn,
+        "journal_title": row.get("Title"),
+        "publisher": row.get("Publisher"),
+        "source": "scimago",
+        "metric_year": row.get("Year"),
+        "sjr": _scimago_float(row.get("SJR")),
+        "subject_areas": areas,
+        "best_quartile": _best_quartile(areas) or row.get("SJR Best Quartile"),
+        "note": "From the bundled Scimago table (CC BY-NC), not live Scopus data.",
+    }
+
+
+# ── Journal metrics via Scopus Serial Title ───────────────────────────────────
+
+def _els_value(node: Any) -> Any:
+    """Unwrap Elsevier's scalar shapes: {\"$\": \"x\"} and single-element lists."""
+    if isinstance(node, list):
+        node = node[0] if node else None
+    if isinstance(node, dict):
+        return node.get("$", node)
+    return node
+
+
+def _els_listify(node: Any) -> list:
+    """Elsevier returns one-element collections as a bare dict, not a list."""
+    if node is None:
+        return []
+    return node if isinstance(node, list) else [node]
+
+
+def _els_metric(entry: dict, list_key: str, item_key: str) -> Optional[float]:
+    """Read a metric such as SJR or SNIP.
+
+    ASSUMPTION (unverified): the shape is
+    ``{"SJRList": {"SJR": [{"@year": "2024", "$": "5.12"}]}}``.
+    api.elsevier.com is unreachable from the development sandbox, so this could
+    not be checked against a live response. A mismatch yields None, which makes
+    the caller fall back rather than crash.
+    """
+    node = entry.get(list_key)
+    if isinstance(node, dict):
+        node = node.get(item_key)
+    try:
+        return float(_els_value(node))
+    except (TypeError, ValueError):
+        return None
+
+
+def _subject_names(entry: dict) -> dict[str, str]:
+    """Map subject codes to readable names from the entry's subject-area block."""
+    out: dict[str, str] = {}
+    for item in _els_listify(entry.get("subject-area")):
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("@code") or "")
+        name = item.get("$") or item.get("@abbrev")
+        if code and name:
+            out[code] = name
+    return out
+
+
+def _scopus_subject_areas(entry: dict) -> list[dict]:
+    """Per-category rank and percentile, newest year only.
+
+    ASSUMPTION (unverified, see _els_metric): citeScoreYearInfoList ->
+    citeScoreYearInfo[] -> citeScoreInformationList[] -> citeScoreInfo[] ->
+    citeScoreSubjectRank[], each rank carrying subjectCode, rank and percentile.
+    """
+    names = _subject_names(entry)
+    for block in _els_listify((entry.get("citeScoreYearInfoList") or {}).get("citeScoreYearInfo")):
+        areas: list[dict] = []
+        for info in _els_listify(block.get("citeScoreInformationList") if isinstance(block, dict) else None):
+            for ci in _els_listify(info.get("citeScoreInfo") if isinstance(info, dict) else None):
+                for r in _els_listify(ci.get("citeScoreSubjectRank") if isinstance(ci, dict) else None):
+                    if not isinstance(r, dict):
+                        continue
+                    code = str(r.get("subjectCode") or "")
+                    pct = r.get("percentile")
+                    areas.append({
+                        "category": r.get("subjectName") or names.get(code) or code or None,
+                        "quartile": _quartile_from_percentile(pct),
+                        "percentile": int(pct) if str(pct or "").isdigit() else None,
+                        "rank": r.get("rank"),
+                    })
+        if areas:
+            return areas
+    return []
+
+
+async def _scopus_journal_metrics(issn: str) -> Optional[dict]:
+    """Query the Scopus Serial Title API.
+
+    Returns None when the journal is unknown or the key lacks the entitlement,
+    so the caller can fall back to Scimago. Genuine upstream failures raise, in
+    line with the convention the rest of this module follows.
+    """
+    try:
+        r = await _scopus_get("content/serial/title", {"issn": issn, "view": "CITESCORE"})
+    except ValueError:
+        # No SCOPUS_API_KEY configured — the Scimago fallback still works.
+        return None
+
+    if r.status_code in (401, 403):
+        logger.info("Serial Title API denied for %s (HTTP %s) — falling back.", issn, r.status_code)
+        return None
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+
+    entries = _els_listify((r.json().get("serial-metadata-response") or {}).get("entry"))
+    entry = next((e for e in entries if isinstance(e, dict)), None)
+    if not entry or entry.get("error"):
+        return None
+
+    areas = _scopus_subject_areas(entry)
+    cite = (entry.get("citeScoreYearInfoList") or {})
+    try:
+        citescore = float(cite.get("citeScoreCurrentMetric"))
+    except (TypeError, ValueError):
+        citescore = None
+
+    return {
+        "issn": issn,
+        "journal_title": _els_value(entry.get("dc:title")),
+        "publisher": _els_value(entry.get("dc:publisher")),
+        "source": "scopus",
+        "metric_year": cite.get("citeScoreCurrentMetricYear"),
+        "sjr": _els_metric(entry, "SJRList", "SJR"),
+        "snip": _els_metric(entry, "SNIPList", "SNIP"),
+        "citescore": citescore,
+        "subject_areas": areas,
+        "best_quartile": _best_quartile(areas),
+    }
+
+
+_journal_cache: dict[str, dict] = {}
+
+
+async def get_journal_metrics(issn: str) -> dict:
+    """Journal quality metrics for an ISSN, above all the quartile per category."""
+    normalised = _normalise_issn(issn)
+    if not normalised:
+        return {"error": f"'{issn}' is not a valid ISSN. Expected eight digits, e.g. \"0001-8392\"."}
+
+    if normalised in _journal_cache:
+        return _journal_cache[normalised]
+
+    result = await _scopus_journal_metrics(normalised)
+    if result is None:
+        result = _scimago_journal_metrics(normalised)
+    if result is None:
+        result = {
+            "issn": normalised,
+            "error": "No metrics found for this ISSN. Scopus returned nothing (or the key "
+                     "lacks Serial Title access) and the journal is not in the bundled "
+                     "Scimago table.",
+        }
+
+    _journal_cache[normalised] = result
+    return result
+
+
 def get_quota_status() -> dict:
     if not _quota_info:
         return {"note": "No Scopus request made yet this session — quota headers appear after the first call."}
@@ -770,6 +1076,18 @@ async def handle_list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="get_journal_metrics",
+            description="Journal quality metrics for an ISSN: the quartile (Q1-Q4) per subject category, "
+                        "plus CiteScore, SJR and SNIP. Uses the Scopus Serial Title API and falls back to "
+                        "the bundled Scimago table when that is unavailable. Get an ISSN from search_scopus "
+                        "or get_abstract_details.",
+            inputSchema={
+                "type": "object",
+                "properties": {"issn": {"type": "string", "description": "Journal ISSN, with or without the hyphen, e.g. \"0001-8392\"."}},
+                "required": ["issn"],
+            },
+        ),
+        types.Tool(
             name="get_quota_status",
             description="Report the Scopus API rate-limit (weekly quota) from the most recent response headers. Returns a note if no Scopus call has been made yet.",
             inputSchema={"type": "object", "properties": {}, "required": []},
@@ -802,6 +1120,8 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
             result = await assess_relevance(args["identifiers"], args["research_context"])
         elif name == "get_pdf_link":
             result = await get_pdf_link(args["doi"])
+        elif name == "get_journal_metrics":
+            result = await get_journal_metrics(args["issn"])
         elif name == "get_quota_status":
             result = get_quota_status()
         else:
