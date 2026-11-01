@@ -451,13 +451,29 @@ Each full result carries `issn` and `e_issn`, which feed straight into
 | `sort` | string | `coverDate` | `coverDate` or `relevancy` |
 | `max_results` | int | 2000 | Stop after this many hits (max 2000 = 80 Scopus requests) |
 | `format` | string | `csv` | `csv` (semicolon-separated, UTF-8 with BOM, Excel-ready) or `json` |
+| `with_abstracts` | bool | false | Add an abstract per row (see below) |
 
-Pages through the whole result set and writes it to the folder set by
-`RESEARCH_EXPORT_DIR` (the "Export folder" of the `.mcpb` install dialog). A
-`<name>.meta.json` with the query, hit count, retrieval time and server version
-is written beside the data file. The response carries the hit count, the paths
-and `truncated`, never the records: use it when a result set is too large for
-the conversation. Existing files are not overwritten.
+Pages through the whole result set and writes it to the export folder: the
+`RESEARCH_EXPORT_DIR` environment variable (the "Export folder" of the `.mcpb`
+install dialog), else `export_dir` in `~/.research-mcp/config.json`, else
+`research-mcp` in the home directory — the first one that can be created wins,
+and `export_dir_source` in the response says which. A `<name>.meta.json` with
+the query, hit count, retrieval time and server version is written beside the
+data file. The response carries the hit count, the paths and `truncated`, never
+the records: use it when a result set is too large for the conversation.
+Existing files are not overwritten. Documents that Scopus repeats across pages
+(it happens with `sort=relevancy`) are written once; `duplicates_removed`
+reports how many were dropped.
+
+**Abstracts.** The columns `abstract` and `abstract_source` are always present.
+With `with_abstracts=true` the export requests Scopus's COMPLETE view, which
+carries the abstract (`abstract_source: scopus`) but needs an entitled key; a
+key without that entitlement gets HTTP 401 on the first page, and the export
+falls back to the STANDARD view and fills abstracts from OpenAlex by DOI, 50 per
+request and without quota (`abstract_source: openalex`). Rows without a DOI or
+without an abstract at OpenAlex stay empty. The `.meta.json` records the view
+used and the counts per source, so a count of mentions in abstracts can be
+traced in a search log.
 
 ### `get_abstract_details`
 | Param | Type | Description |

@@ -191,7 +191,7 @@ async def test_export_writes_csv_and_meta(monkeypatch, export_dir):
     with open(out["path"], newline="", encoding="utf-8-sig") as fh:
         rows = list(csv.DictReader(fh, delimiter=";"))
     assert len(rows) == 70
-    assert list(rows[0]) == server._SCOPUS_FIELDS
+    assert list(rows[0]) == server._EXPORT_FIELDS
     assert rows[0]["scopus_id"] == "1000" and rows[0]["creator"] == "Müller A."
     meta = json.loads((export_dir / "it-governance.meta.json").read_text(encoding="utf-8"))
     assert meta["query"] == "q" and meta["total_results"] == 70 and meta["exported"] == 70

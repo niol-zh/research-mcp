@@ -1,7 +1,7 @@
 {
   "name": "research-mcp",
   "displayName": "Research MCP",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Academic literature research for Claude Cowork: Scopus search with hit counts and paging, citations via OpenAlex, journal quartiles, open-access PDFs and CSV export.",
   "author": {
     "name": "Olivier Niklaus",
@@ -16,7 +16,7 @@
       "command": "sh",
       "args": [
         "-c",
-        "export PATH=\"$HOME/.local/bin:$PATH\"; command -v uvx >/dev/null 2>&1 || { curl -LsSf https://astral.sh/uv/install.sh || wget -qO- https://astral.sh/uv/install.sh; } | sh -s -- --quiet >&2; exec uvx --from https://github.com/niol-zh/research-mcp/archive/refs/tags/v0.7.1.zip research-mcp"
+        "export PATH=\"$HOME/.local/bin:$PATH\"; command -v uvx >/dev/null 2>&1 || { curl -LsSf https://astral.sh/uv/install.sh || wget -qO- https://astral.sh/uv/install.sh; } | sh -s -- --quiet >&2; exec uvx --from https://github.com/niol-zh/research-mcp/archive/refs/tags/v0.7.2.zip research-mcp"
       ]
     }
   }

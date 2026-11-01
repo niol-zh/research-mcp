@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "research-mcp",
   "display_name": "Research MCP",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Academic literature research: Scopus search with hit counts and paging, citations, journal quartiles, open-access PDFs and CSV export.",
   "long_description": "Combines Scopus search with free, open scholarly APIs so you get abstracts, author metrics, citation networks, journal quartiles and open-access PDFs without needing institutional Scopus entitlements. Forward citations and reference lists come from OpenAlex, abstracts from CrossRef, open-access PDFs from Unpaywall. Every Scopus search reports the total hit count, the query as sent and the retrieval time for your search log; large result sets can be exported to a CSV or JSON file.",
   "author": {

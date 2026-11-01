@@ -358,9 +358,11 @@ _SCOPUS_FIELDS = [
     "cover_date", "doi", "cited_by_count", "aggregation_type", "url",
 ]
 _SCOPUS_COMPACT_FIELDS = ["scopus_id", "title", "year", "doi", "cited_by_count", "publication_name"]
+# Export rows always carry the abstract columns so the CSV header is stable.
+_EXPORT_FIELDS = _SCOPUS_FIELDS + ["abstract", "abstract_source"]
 
 
-def _scopus_entry(e: dict, compact: bool = False) -> dict:
+def _scopus_entry(e: dict, compact: bool = False, with_abstract: bool = False) -> dict:
     full = {
         "scopus_id":        (e.get("dc:identifier") or "").replace("SCOPUS_ID:", ""),
         "title":            e.get("dc:title"),
@@ -374,13 +376,34 @@ def _scopus_entry(e: dict, compact: bool = False) -> dict:
         "aggregation_type": e.get("prism:aggregationType"),
         "url": next((l["@href"] for l in e.get("link", []) if l.get("@ref") == "scopus"), None),
     }
+    if with_abstract:
+        # dc:description is only present in the COMPLETE view (entitled keys).
+        abstract = (e.get("dc:description") or "").strip() or None
+        full["abstract"] = abstract
+        full["abstract_source"] = "scopus" if abstract else None
     if not compact:
         return full
     full["year"] = (full["cover_date"] or "")[:4] or None
     return {k: full[k] for k in _SCOPUS_COMPACT_FIELDS}
 
 
-async def _scopus_page(query: str, start: int, count: int, sort: str) -> tuple[list[dict], Optional[int]]:
+def _dedupe_entries(entries: list[dict]) -> tuple[list[dict], int]:
+    """Drop repeated Scopus IDs. Paging a relevancy-sorted result set can show
+    the same document on two pages; the first occurrence wins."""
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for e in entries:
+        sid = e.get("dc:identifier") or ""
+        if sid in seen:
+            continue
+        seen.add(sid)
+        unique.append(e)
+    return unique, len(entries) - len(unique)
+
+
+async def _scopus_page(
+    query: str, start: int, count: int, sort: str, view: str = "STANDARD"
+) -> tuple[list[dict], Optional[int]]:
     """One Scopus Search request. Returns (raw entries, total hit count).
 
     An empty result set is not an empty list: Scopus answers with a single
@@ -389,7 +412,7 @@ async def _scopus_page(query: str, start: int, count: int, sort: str) -> tuple[l
     without an identifier.
     """
     r = await _scopus_get("content/search/scopus", {
-        "query": query, "count": count, "start": start, "sort": sort, "view": "STANDARD",
+        "query": query, "count": count, "start": start, "sort": sort, "view": view,
     })
     r.raise_for_status()
     sr = r.json().get("search-results", {})
@@ -402,7 +425,7 @@ async def _scopus_page(query: str, start: int, count: int, sort: str) -> tuple[l
 
 
 async def _scopus_collect(
-    query: str, start: int, limit: int, sort: str, pause: float = 0.0
+    query: str, start: int, limit: int, sort: str, pause: float = 0.0, view: str = "STANDARD"
 ) -> tuple[list[dict], Optional[int], int]:
     """Page through Scopus from `start` until `limit` entries are collected or
     the result set ends. Returns (entries, total hit count, requests made)."""
@@ -414,7 +437,7 @@ async def _scopus_collect(
         page_size = min(SCOPUS_PAGE_SIZE, limit - len(entries))
         if calls and pause:
             await asyncio.sleep(pause)
-        page, total = await _scopus_page(query, offset, page_size, sort)
+        page, total = await _scopus_page(query, offset, page_size, sort, view=view)
         calls += 1
         entries.extend(page)
         offset += len(page)
@@ -461,18 +484,49 @@ async def search_scopus(
     if compact is None:
         compact = n > SCOPUS_PAGE_SIZE
     entries, total, _ = await _scopus_collect(query, start, n, sort)
+    fetched = len(entries)
+    entries, duplicates = _dedupe_entries(entries)
     results = [_scopus_entry(e, compact=compact) for e in entries]
-    more = len(results) == n and (total is None or start + len(results) < total)
+    more = fetched == n and (total is None or start + fetched < total)
     out.update({
         "total_results": total,
         "returned": len(results),
-        "next_start": start + len(results) if more else None,
+        "next_start": start + fetched if more else None,
         "quota_remaining": _quota_info.get("remaining"),
         "results": results,
     })
+    if duplicates:
+        out["duplicates_removed"] = duplicates
     if compact:
         out["note"] = "Compact records (count > 25). Pass compact=false for all fields."
     return out
+
+
+async def _openalex_abstracts(dois: list[str]) -> dict[str, str]:
+    """Abstracts for DOIs from OpenAlex, 50 per request (free, no quota).
+    Returns {doi lower-cased: abstract} for the DOIs that have one."""
+    found: dict[str, str] = {}
+    wanted = sorted({d.strip().lower() for d in dois if d and d.strip()})
+    for i in range(0, len(wanted), OPENALEX_MAX_BATCH):
+        chunk = wanted[i:i + OPENALEX_MAX_BATCH]
+        try:
+            r = await _openalex_get("works", {
+                "filter": "doi:" + "|".join(chunk),
+                "select": "doi,abstract_inverted_index",
+                "per-page": len(chunk),
+            })
+        except httpx.HTTPError as e:
+            logger.warning("OpenAlex abstract lookup failed: %s", e)
+            continue
+        if r.status_code != 200:
+            logger.warning("OpenAlex abstract lookup failed: HTTP %s", r.status_code)
+            continue
+        for w in r.json().get("results", []):
+            doi = (w.get("doi") or "").replace("https://doi.org/", "").lower()
+            abstract = _reconstruct_abstract(w.get("abstract_inverted_index"))
+            if doi and abstract:
+                found[doi] = abstract
+    return found
 
 
 _EXPORT_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -519,6 +573,7 @@ async def export_scopus_results(
     sort: str = "coverDate",
     max_results: int = SCOPUS_EXPORT_MAX,
     format: str = "csv",
+    with_abstracts: bool = False,
 ) -> dict:
     """Page through a whole Scopus result set and write it to a file.
 
@@ -526,6 +581,10 @@ async def export_scopus_results(
     requests). Nothing from the file is returned; the response carries the hit
     count, the path and the search-log metadata. A `<name>.meta.json` sits next
     to the data file with the same metadata.
+
+    `with_abstracts` adds an abstract per row: from Scopus itself when the key
+    is entitled to the COMPLETE view, otherwise from OpenAlex by DOI (50 per
+    request, no quota). `abstract_source` says which, or is empty.
     """
     fmt = str(format or "csv").lower()
     if fmt not in ("csv", "json"):
@@ -549,25 +608,58 @@ async def export_scopus_results(
 
     limit = _clamp_count(max_results, SCOPUS_EXPORT_MAX, default=SCOPUS_EXPORT_MAX)
     retrieved_at = _now_iso()
-    entries, total, calls = await _scopus_collect(query, 0, limit, sort, pause=SCOPUS_EXPORT_PAUSE)
-    rows = [_scopus_entry(e) for e in entries]
-    truncated = (total is not None and len(rows) < total) or (total is None and len(rows) >= limit)
+
+    # Abstracts come with the COMPLETE view, which only entitled keys may use;
+    # a 401/403 on the first page means "not entitled", so fall back to STANDARD.
+    view = "COMPLETE" if with_abstracts else "STANDARD"
+    try:
+        entries, total, calls = await _scopus_collect(query, 0, limit, sort, pause=SCOPUS_EXPORT_PAUSE, view=view)
+    except httpx.HTTPStatusError as e:
+        if view == "COMPLETE" and e.response.status_code in (401, 403):
+            logger.info("Scopus COMPLETE view not entitled (HTTP %s); abstracts via OpenAlex", e.response.status_code)
+            view = "STANDARD"
+            entries, total, calls = await _scopus_collect(query, 0, limit, sort, pause=SCOPUS_EXPORT_PAUSE, view=view)
+        else:
+            raise
+    fetched = len(entries)
+    entries, duplicates = _dedupe_entries(entries)
+    rows = [_scopus_entry(e, with_abstract=True) for e in entries]
+    truncated = (total is not None and fetched < total) or (total is None and fetched >= limit)
+
+    abstracts_meta: dict[str, Any] = {"requested": with_abstracts}
+    if with_abstracts:
+        missing = [r["doi"] for r in rows if not r["abstract"] and r.get("doi")]
+        openalex = await _openalex_abstracts(missing)
+        for r in rows:
+            if not r["abstract"] and r.get("doi"):
+                found = openalex.get(r["doi"].strip().lower())
+                if found:
+                    r["abstract"], r["abstract_source"] = found, "openalex"
+        abstracts_meta.update({
+            "scopus_view": view,
+            "from_scopus": sum(1 for r in rows if r["abstract_source"] == "scopus"),
+            "from_openalex": sum(1 for r in rows if r["abstract_source"] == "openalex"),
+            "missing": sum(1 for r in rows if not r["abstract"]),
+            "openalex_requests": (len({d.lower() for d in missing}) + OPENALEX_MAX_BATCH - 1) // OPENALEX_MAX_BATCH,
+        })
 
     meta = {
         "query": query,
         "sort": sort,
         "total_results": total,
         "exported": len(rows),
+        "duplicates_removed": duplicates,
         "truncated": truncated,
         "retrieved_at": retrieved_at,
         "mcp_version": _mcp_version(),
         "source": "scopus",
+        "abstracts": abstracts_meta,
     }
     try:
         if fmt == "csv":
             # UTF-8 with BOM and ';' so Excel opens it correctly without an import dialog.
             with open(path, "w", newline="", encoding="utf-8-sig") as fh:
-                writer = csv.DictWriter(fh, fieldnames=_SCOPUS_FIELDS, delimiter=";")
+                writer = csv.DictWriter(fh, fieldnames=_EXPORT_FIELDS, delimiter=";")
                 writer.writeheader()
                 writer.writerows(rows)
         else:
@@ -1378,6 +1470,12 @@ async def handle_list_tools() -> list[types.Tool]:
                     },
                     "format": {"type": "string", "enum": ["csv", "json"], "default": "csv",
                                "description": "csv (semicolon-separated, Excel-ready) or json."},
+                    "with_abstracts": {
+                        "type": "boolean", "default": False,
+                        "description": "Add an abstract per row: from Scopus when the key is entitled to the "
+                                       "COMPLETE view, otherwise from OpenAlex by DOI (50 per request, no quota). "
+                                       "The abstract_source column says which.",
+                    },
                 },
                 "required": ["query", "filename"],
             },
@@ -1530,6 +1628,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
                 sort=args.get("sort", "coverDate"),
                 max_results=args.get("max_results", SCOPUS_EXPORT_MAX),
                 format=args.get("format", "csv"),
+                with_abstracts=bool(args.get("with_abstracts", False)),
             )
         elif name == "get_abstract_details":
             result = await get_abstract_details(args["scopus_id"])
