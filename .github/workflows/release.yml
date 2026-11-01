@@ -85,6 +85,16 @@ jobs:
           mcpb pack . "research-mcp-${TAG}.mcpb"
           ls -la research-mcp-*.mcpb
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # The Cowork plugin is the same server packaged for Customize > Plugins >
+      # Upload plugin; settings come from ~/.research-mcp/config.json.
+      - name: Build the Cowork plugin
+        env:
+          TAG: ${{ inputs.tag }}
+        run: bash scripts/build-plugin.sh "research-mcp-${TAG}-plugin.zip"
+
       - name: Create tag and release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -102,7 +112,7 @@ jobs:
           fi
           # Attach the bundle when one was built, so the release page offers a
           # one-click install alongside the source.
-          for f in research-mcp-*.mcpb; do
+          for f in research-mcp-*.mcpb research-mcp-*-plugin.zip; do
             [ -f "$f" ] && args+=("$f")
           done
           gh "${args[@]}"

@@ -23,12 +23,55 @@ CROSSREF_BASE  = "https://api.crossref.org/works/"
 OPENALEX_BASE  = "https://api.openalex.org/"
 UNPAYWALL_BASE = "https://api.unpaywall.org/v2/"
 
+# ── Settings ──────────────────────────────────────────────────────────────────
+# Every setting can come from an environment variable (the MCP config's env
+# block, or the .mcpb install dialog) or, when that is unset or empty, from a
+# local JSON file. The file exists for hosts without a settings dialog, such as
+# Claude Cowork plugins, where secrets must never be shipped inside the plugin.
+CONFIG_FILE_ENV = "RESEARCH_MCP_CONFIG"
+DEFAULT_CONFIG_FILE = Path.home() / ".research-mcp" / "config.json"
+_CONFIG_KEYS = {"scopus_api_key", "unpaywall_email", "export_dir"}
+_config_cache: Optional[dict] = None
+
+
+def _config_path() -> Path:
+    return Path(os.environ.get(CONFIG_FILE_ENV) or DEFAULT_CONFIG_FILE).expanduser()
+
+
+def _load_config_file() -> dict:
+    """Read the config file once. Missing file -> {}; unreadable file -> {} plus a warning."""
+    global _config_cache
+    if _config_cache is None:
+        path = _config_path()
+        data: dict = {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+            if isinstance(raw, dict):
+                data = {k: str(v) for k, v in raw.items() if k in _CONFIG_KEYS and v is not None}
+            else:
+                logger.warning("Config file %s must contain a JSON object; ignoring it.", path)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            logger.warning("Could not read config file %s: %s", path, e)
+        _config_cache = data
+    return _config_cache
+
+
+def _setting(env_name: str, key: str) -> str:
+    """Environment variable first (non-empty), then the config file, else ''."""
+    value = os.environ.get(env_name) or ""
+    if value:
+        return value
+    return _load_config_file().get(key) or ""
+
+
 # Unpaywall and OpenAlex ask for a contact email (their "polite pool").
 # Unpaywall *rejects* requests without a real address, so get_pdf_link needs this.
 # `or` rather than a default argument: a configuration UI (the Claude Desktop
 # extension dialog) may set the variable to an empty string, which must fall
 # back too.
-UNPAYWALL_EMAIL = os.environ.get("UNPAYWALL_EMAIL") or "research-mcp@example.com"
+UNPAYWALL_EMAIL = _setting("UNPAYWALL_EMAIL", "unpaywall_email") or "research-mcp@example.com"
 
 # Scopus serves at most 25 hits per request on a key without institutional
 # entitlement, so larger result sets are collected page by page (`start`).
@@ -89,9 +132,12 @@ _generic_client: Optional[httpx.AsyncClient] = None
 
 
 def get_api_key() -> str:
-    key = os.environ.get("SCOPUS_API_KEY", "")
+    key = _setting("SCOPUS_API_KEY", "scopus_api_key")
     if not key:
-        raise ValueError("SCOPUS_API_KEY environment variable not set.")
+        raise ValueError(
+            "SCOPUS_API_KEY environment variable not set. Set it in your MCP config, or put "
+            f'{{"scopus_api_key": "..."}} into {_config_path()}.'
+        )
     return key
 
 
@@ -445,11 +491,12 @@ async def export_scopus_results(
     count, the path and the search-log metadata. A `<name>.meta.json` sits next
     to the data file with the same metadata.
     """
-    directory = os.environ.get(EXPORT_DIR_ENV) or ""
+    directory = _setting(EXPORT_DIR_ENV, "export_dir")
     if not directory:
         return {
             "error": f"{EXPORT_DIR_ENV} is not set. Point it at the folder exports should go to: "
-                     "the extension's 'Export folder' setting, or the env block of your MCP config."
+                     "the extension's 'Export folder' setting, the env block of your MCP config, "
+                     f'or {{"export_dir": "..."}} in {_config_path()}.'
         }
     fmt = str(format or "csv").lower()
     if fmt not in ("csv", "json"):
@@ -1520,6 +1567,11 @@ def _describe_interpreter() -> str:
 
 async def main():
     logger.info("Starting research-mcp: %s", _describe_interpreter())
+    config_path = _config_path()
+    logger.info(
+        "Config file %s: %s", config_path,
+        f"loaded keys {sorted(_load_config_file())}" if config_path.is_file() else "not present (using environment only)",
+    )
     try:
         async with stdio_server() as (r, w):
             await server.run(r, w, server.create_initialization_options())

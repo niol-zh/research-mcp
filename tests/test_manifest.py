@@ -69,6 +69,35 @@ async def test_manifest_lists_every_server_tool(manifest):
     assert set(listed) == served
 
 
+# ── Cowork plugin manifest (.claude-plugin/plugin.json) ───────────────────────
+
+@pytest.fixture(scope="module")
+def plugin() -> dict:
+    return json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+
+
+def test_plugin_manifest_basics(plugin):
+    assert re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", plugin["name"])
+    assert plugin["version"] == _pyproject_version()
+
+
+def test_plugin_runs_the_console_script_with_system_python(plugin):
+    cfg = plugin["mcpServers"]["research"]
+    assert cfg["command"] == "uv"
+    assert cfg["args"][:3] == ["run", "--python-preference", "system"]
+    assert "${CLAUDE_PLUGIN_ROOT}" in cfg["args"]
+    assert cfg["args"][-1] == "research-mcp"
+    # the venv lives outside the plugin directory so updates do not wipe it
+    assert cfg["env"]["UV_PROJECT_ENVIRONMENT"].startswith("${CLAUDE_PLUGIN_DATA}")
+    # no secrets in the plugin: Cowork has no settings dialog, the config file does that
+    assert not any(k in cfg["env"] for k in ("SCOPUS_API_KEY", "UNPAYWALL_EMAIL"))
+
+
+def test_config_example_has_every_key():
+    example = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+    assert set(example) == server._CONFIG_KEYS
+
+
 def test_unpaywall_email_falls_back_when_empty(monkeypatch):
     # The extension dialog can hand over an empty string; that must not become
     # an empty mailto in the User-Agent.

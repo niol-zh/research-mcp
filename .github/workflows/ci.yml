@@ -57,3 +57,18 @@ jobs:
 
       - name: Trial pack
         run: npx --yes @anthropic-ai/mcpb@2 pack . "${RUNNER_TEMP}/research-mcp.mcpb"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Check plugin manifest version matches pyproject.toml
+        run: |
+          have="$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)"
+          plug="$(jq -r '.version' .claude-plugin/plugin.json)"
+          if [ "$have" != "$plug" ]; then
+            echo "::error::pyproject.toml says $have but .claude-plugin/plugin.json says $plug."
+            exit 1
+          fi
+
+      - name: Trial build of the Cowork plugin
+        run: bash scripts/build-plugin.sh "${RUNNER_TEMP}/research-mcp-plugin.zip"

@@ -221,7 +221,47 @@ If you've cloned the repo and want to run from disk:
 
 ---
 
-### Option C — Claude Cowork (remote connector, needs an HTTPS URL)
+### Option C — Claude Cowork plugin (zip, runs on your own computer)
+
+Cowork sessions that run on your computer load local MCP servers from
+**plugins**. Plugins have no settings dialog, so the key and folders come from
+a small config file instead. Three steps:
+
+1. **Install uv** (once). Windows PowerShell:
+   `winget install astral-sh.uv` — or `irm https://astral.sh/uv/install.ps1 | iex`.
+   macOS: `brew install uv`. Python itself is not required; uv reuses an
+   installed Python ≥ 3.10 or fetches one.
+2. **Create the config file** at `%USERPROFILE%\.research-mcp\config.json`
+   (macOS/Linux: `~/.research-mcp/config.json`), modelled on
+   [`config.example.json`](config.example.json):
+
+   ```json
+   {
+     "scopus_api_key": "your-scopus-api-key",
+     "unpaywall_email": "you@example.com",
+     "export_dir": "C:/Users/you/Documents/research-mcp"
+   }
+   ```
+
+   Environment variables, when set, take precedence over the file. A different
+   file location can be given via `RESEARCH_MCP_CONFIG`.
+3. **Upload the plugin.** Download `research-mcp-vX.Y.Z-plugin.zip` from the
+   [latest release](https://github.com/niol-zh/research-mcp/releases/latest)
+   and add it under **Customize → Plugins → Add → Upload plugin**. Keep the
+   `.zip` extension; the upload rejects `.plugin` files.
+
+The first start installs `mcp` and `httpx` into a private environment and can
+take up to a minute; later starts are instant. The server's log shows which
+Python it runs on and whether the config file was found.
+
+> Plugins serve **Cowork** sessions. Chat in Claude Desktop uses the `.mcpb`
+> extension (Option A) or the hand-written config (Option B) instead.
+
+To build the zip yourself: `scripts/build-plugin.sh` (needs `git`, `uv`, `zip`).
+
+---
+
+### Option D — Claude Cowork via remote connector (needs an HTTPS URL)
 
 Cowork runs in an isolated cloud VM and **cannot reach a local stdio process**.
 It needs the server exposed over **HTTPS using the Streamable HTTP transport**.

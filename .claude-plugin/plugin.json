@@ -1,0 +1,30 @@
+{
+  "name": "research-mcp",
+  "displayName": "Research MCP",
+  "version": "0.7.0",
+  "description": "Academic literature research for Claude Cowork: Scopus search with hit counts and paging, citations via OpenAlex, journal quartiles, open-access PDFs and CSV export.",
+  "author": {
+    "name": "Olivier Niklaus",
+    "url": "https://github.com/niol-zh"
+  },
+  "homepage": "https://github.com/niol-zh/research-mcp",
+  "repository": "https://github.com/niol-zh/research-mcp",
+  "license": "MIT",
+  "keywords": ["research", "scopus", "openalex", "citations", "academic", "bibliometrics"],
+  "mcpServers": {
+    "research": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--python-preference",
+        "system",
+        "--directory",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "research-mcp"
+      ],
+      "env": {
+        "UV_PROJECT_ENVIRONMENT": "${CLAUDE_PLUGIN_DATA}/venv"
+      }
+    }
+  }
+}

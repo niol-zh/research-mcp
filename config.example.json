@@ -1,0 +1,5 @@
+{
+  "scopus_api_key": "your-scopus-api-key",
+  "unpaywall_email": "you@example.com",
+  "export_dir": "C:/Users/you/Documents/research-mcp"
+}

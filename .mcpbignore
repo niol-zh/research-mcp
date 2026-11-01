@@ -13,3 +13,7 @@ dist/
 build/
 *.egg-info/
 .pytest_cache/
+
+# Cowork plugin files; they are not part of the .mcpb bundle.
+.claude-plugin/
+config.example.json
