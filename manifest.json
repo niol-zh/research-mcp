@@ -2,9 +2,9 @@
   "manifest_version": "0.4",
   "name": "research-mcp",
   "display_name": "Research MCP",
-  "version": "0.6.0",
-  "description": "Academic literature research: Scopus search, citations, journal quartiles and open-access PDFs.",
-  "long_description": "Combines Scopus search with free, open scholarly APIs so you get abstracts, author metrics, citation networks, journal quartiles and open-access PDFs without needing institutional Scopus entitlements. Forward citations and reference lists come from OpenAlex, abstracts from CrossRef, open-access PDFs from Unpaywall.",
+  "version": "0.7.0",
+  "description": "Academic literature research: Scopus search with hit counts and paging, citations, journal quartiles, open-access PDFs and CSV export.",
+  "long_description": "Combines Scopus search with free, open scholarly APIs so you get abstracts, author metrics, citation networks, journal quartiles and open-access PDFs without needing institutional Scopus entitlements. Forward citations and reference lists come from OpenAlex, abstracts from CrossRef, open-access PDFs from Unpaywall. Every Scopus search reports the total hit count, the query as sent and the retrieval time for your search log; large result sets can be exported to a CSV or JSON file.",
   "author": {
     "name": "Olivier Niklaus",
     "url": "https://github.com/niol-zh"
@@ -26,7 +26,8 @@
       "args": ["run", "--python-preference", "system", "--directory", "${__dirname}", "research-mcp"],
       "env": {
         "SCOPUS_API_KEY": "${user_config.scopus_api_key}",
-        "UNPAYWALL_EMAIL": "${user_config.unpaywall_email}"
+        "UNPAYWALL_EMAIL": "${user_config.unpaywall_email}",
+        "RESEARCH_EXPORT_DIR": "${user_config.export_directory}"
       }
     }
   },
@@ -44,10 +45,18 @@
       "description": "A real email address. Unpaywall and OpenAlex require one for their polite pool and reject requests without it.",
       "sensitive": false,
       "required": true
+    },
+    "export_directory": {
+      "type": "directory",
+      "title": "Export folder",
+      "description": "Folder that export_scopus_results writes CSV/JSON files to, e.g. your literature folder.",
+      "default": "${DOCUMENTS}/research-mcp",
+      "required": false
     }
   },
   "tools": [
-    {"name": "search_scopus", "description": "Search Scopus by query string."},
+    {"name": "search_scopus", "description": "Search Scopus by query string; returns the total hit count, search-log fields and one page of records."},
+    {"name": "export_scopus_results", "description": "Export a whole Scopus result set (up to 2000 hits) to a CSV or JSON file in the export folder."},
     {"name": "get_abstract_details", "description": "Scopus metadata plus the abstract text from CrossRef."},
     {"name": "get_author_profile", "description": "Author h-index, citations, ORCID and affiliations via OpenAlex."},
     {"name": "get_citing_papers", "description": "Forward citations: papers that cite a given document."},

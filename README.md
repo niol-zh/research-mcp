@@ -12,13 +12,15 @@ Scopus entitlements.
 
 | Tool | Data source | Returns |
 |------|-------------|---------|
-| `search_scopus` | Elsevier Scopus | Documents matching a query (title, DOI, citations, …) |
+| `search_scopus` | Elsevier Scopus | Documents matching a query (title, DOI, citations, …) plus the **total hit count** and search-log fields; pages through larger sets |
+| `export_scopus_results` | Elsevier Scopus | A whole result set (up to 2000 hits) written to a CSV/JSON file |
 | `get_abstract_details` | Scopus + [CrossRef](https://www.crossref.org) | Metadata + abstract text |
 | `get_author_profile` | [OpenAlex](https://openalex.org) | h-index, citation count, paper count, affiliations, ORCID |
 | `get_citing_papers` | OpenAlex (default) or Scopus | Papers that cite a given document (**forward** citations) |
 | `get_references` | OpenAlex + CrossRef | Papers cited **by** a given document (**backward** citations) |
 | `assess_relevance` | OpenAlex | Abstract, topics, keywords and term overlap for screening papers against a research context |
 | `get_pdf_link` | [Unpaywall](https://unpaywall.org) | Open-access PDF link for a DOI |
+| `get_journal_metrics` | Scopus Serial Title or Scimago | Journal quartile per subject category, CiteScore, SJR, SNIP |
 | `get_quota_status` | — | Reminder about Scopus API quota |
 
 ### Citation traversal in both directions
@@ -130,8 +132,10 @@ CrossRef, author metrics from OpenAlex, and PDFs from Unpaywall.
 ### Quota & fair use
 
 - Watch your weekly quota — every call returns `X-RateLimit-Remaining` headers.
-- Don't hammer the API in tight loops; the search tools cap at 25 results per
-  call by design.
+- Scopus serves 25 hits per request on a free key. `search_scopus` pages
+  through up to 200 hits per call (8 requests) and `export_scopus_results`
+  through up to 2000 (80 requests); `count_only=true` costs a single request.
+  Don't run exports in tight loops.
 - The key is a secret. Keep it in the `env` block of your MCP config, never
   commit it to git (this repo's `.gitignore` already excludes `.env` and keys).
 
@@ -180,7 +184,8 @@ Add this to your MCP config (`~/.claude.json`, or the Claude Desktop
       "args": ["--from", "git+https://github.com/niol-zh/research-mcp", "research-mcp"],
       "env": {
         "SCOPUS_API_KEY": "your-scopus-api-key",
-        "UNPAYWALL_EMAIL": "you@example.com"
+        "UNPAYWALL_EMAIL": "you@example.com",
+        "RESEARCH_EXPORT_DIR": "/path/to/your/literature/folder"
       }
     }
   }
@@ -193,6 +198,10 @@ environment automatically.
 > **`UNPAYWALL_EMAIL` is required for the `get_pdf_link` tool.** Unpaywall rejects
 > requests without a real contact email (HTTP 422). Use your own address. All
 > other tools work without it.
+>
+> **`RESEARCH_EXPORT_DIR`** is the folder `export_scopus_results` writes to. Leave
+> it out if you never export; the tool then explains what to set. The `.mcpb`
+> bundle asks for it as "Export folder" in the install dialog.
 
 #### Local clone instead of GitHub
 
@@ -352,12 +361,52 @@ on HTTP 429, quota tracking and error paths.
 ### `search_scopus`
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `query` | string | — | Scopus query, e.g. `TITLE(agile) AND PUBYEAR > 2020` |
-| `count` | int | 5 | Results to return (max 25) |
+| `query` | string | — | Scopus query, e.g. `TITLE(agile) AND PUBYEAR > 2020`. Sent exactly as given. |
+| `count` | int | 5 | Results to return (max 200). Scopus serves 25 per request; above 25 the server pages and returns **compact** records |
 | `sort` | string | `coverDate` | `coverDate` or `relevancy` |
+| `start` | int | 0 | 0-based offset; pass `next_start` from the previous response to page |
+| `count_only` | bool | false | Only the hit count, one request, no records |
+| `compact` | bool | auto | Force compact (`scopus_id, title, year, doi, cited_by_count, publication_name`) or full records |
 
-Each result carries `issn` and `e_issn`, which feed straight into
+The response is an object, not a bare list:
+
+```json
+{
+  "query": "TITLE-ABS-KEY(\"IT governance\") AND PUBYEAR > 2020",
+  "total_results": 1234,
+  "returned": 25,
+  "start": 0,
+  "next_start": 25,
+  "retrieved_at": "2026-11-01T13:05:00+01:00",
+  "mcp_version": "0.7.0",
+  "quota_remaining": "19876",
+  "results": [ { "scopus_id": "…", "title": "…", "doi": "…", "…": "…" } ]
+}
+```
+
+`total_results` comes from Scopus's `opensearch:totalResults`, so it is the
+count for the whole query, not for the page. `query`, `retrieved_at`,
+`total_results` and `mcp_version` are what a PRISMA-S search log needs per
+query. Zero hits give `total_results: 0` and an empty `results` list.
+
+Each full result carries `issn` and `e_issn`, which feed straight into
 [`get_journal_metrics`](#get_journal_metrics).
+
+### `export_scopus_results`
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `query` | string | — | Scopus query, sent exactly as given |
+| `filename` | string | — | Bare file name without folder; the extension is added |
+| `sort` | string | `coverDate` | `coverDate` or `relevancy` |
+| `max_results` | int | 2000 | Stop after this many hits (max 2000 = 80 Scopus requests) |
+| `format` | string | `csv` | `csv` (semicolon-separated, UTF-8 with BOM, Excel-ready) or `json` |
+
+Pages through the whole result set and writes it to the folder set by
+`RESEARCH_EXPORT_DIR` (the "Export folder" of the `.mcpb` install dialog). A
+`<name>.meta.json` with the query, hit count, retrieval time and server version
+is written beside the data file. The response carries the hit count, the paths
+and `truncated`, never the records: use it when a result set is too large for
+the conversation. Existing files are not overwritten.
 
 ### `get_abstract_details`
 | Param | Type | Description |
@@ -375,9 +424,14 @@ Forward citations — papers that **cite** the given document.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `scopus_id` | string | — | A DOI or OpenAlex work ID (default source), or a Scopus ID |
-| `count` | int | 5 | Results to return (max 25) |
+| `count` | int | 5 | Results to return (max 100) |
 | `sort` | string | `coverDate` | `coverDate` or `relevancy` (Scopus only) |
 | `source` | string | `openalex` | `openalex` (free, no quota, most-cited first) or `scopus` |
+| `page` | int | 1 | OpenAlex page (1-based); pass `next_page` from the previous response |
+| `start` | int | 0 | Scopus offset (0-based), as in `search_scopus` |
+
+The OpenAlex response reports `total_citing`, `page`, `per_page` and
+`next_page`.
 
 > **Why OpenAlex is the default:** Scopus serves forward citations through the
 > `REFEID()` search field, which is **restricted**. On a free key it returns
@@ -392,11 +446,13 @@ Backward citations — papers **cited by** the given document, most-cited first.
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `identifier` | string | — | DOI, OpenAlex work ID (`W…`) or Scopus ID |
-| `count` | int | 10 | References to return (max 25) |
+| `count` | int | 10 | References to return (max 100) |
+| `start` | int | 0 | Offset into the reference list; pass `next_start` from the previous response |
 
 Reference lists come from OpenAlex, falling back to CrossRef when OpenAlex has
-none. For works with more than 50 references, ranking considers the first 50;
-`total_references` always reports the true count.
+none. Each call ranks a window of at least 50 references from `start` by
+citation count and returns the top `count`; `next_start` points at the next
+window and `total_references` always reports the true count.
 
 ### `assess_relevance`
 Evidence for screening papers against a research context — **no verdict, no score**.

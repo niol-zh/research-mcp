@@ -39,24 +39,28 @@ async def test_search_scopus_parses_entries(monkeypatch):
 
     monkeypatch.setattr(server, "scopus_client", lambda: _client(handler))
     out = await server.search_scopus("TITLE(agile)")
-    assert out[0]["scopus_id"] == "12345"
-    assert out[0]["title"] == "Agile teams"
-    assert out[0]["url"] == "https://scopus.com/x"
+    hit = out["results"][0]
+    assert hit["scopus_id"] == "12345"
+    assert hit["title"] == "Agile teams"
+    assert hit["url"] == "https://scopus.com/x"
     # quota headers should have been captured
     assert server._quota_info["remaining"] == "19999"
 
 
 @pytest.mark.asyncio
 async def test_search_scopus_clamps_count(monkeypatch):
+    """A single page never asks Scopus for more than its page size."""
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["count"] = request.url.params.get("count")
+        captured["start"] = request.url.params.get("start")
         return httpx.Response(200, json={"search-results": {"entry": []}})
 
     monkeypatch.setattr(server, "scopus_client", lambda: _client(handler))
     await server.search_scopus("q", count=999)
-    assert captured["count"] == str(server.MAX_COUNT)
+    assert captured["count"] == str(server.SCOPUS_PAGE_SIZE)
+    assert captured["start"] == "0"
 
 
 # ── get_author_profile (OpenAlex) ─────────────────────────────────────────────
@@ -159,6 +163,16 @@ def test_quota_status_populated():
 @pytest.mark.parametrize("value,expected", [(0, 1), (5, 5), (25, 25), (999, 25), ("8", 8), (None, 5), ("x", 5)])
 def test_clamp_count(value, expected):
     assert server._clamp_count(value) == expected
+
+
+def test_clamp_count_takes_limit_and_default():
+    assert server._clamp_count(999, limit=100) == 100
+    assert server._clamp_count(None, limit=100, default=10) == 10
+
+
+@pytest.mark.parametrize("value,expected", [(0, 0), (25, 25), (-3, 0), ("50", 50), (None, 0), ("x", 0)])
+def test_clamp_start(value, expected):
+    assert server._clamp_start(value) == expected
 
 
 # ── identifier classification ─────────────────────────────────────────────────

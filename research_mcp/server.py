@@ -5,6 +5,8 @@ import os
 import logging
 import re
 import sys
+from datetime import datetime
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Optional
 
@@ -28,12 +30,29 @@ UNPAYWALL_BASE = "https://api.unpaywall.org/v2/"
 # back too.
 UNPAYWALL_EMAIL = os.environ.get("UNPAYWALL_EMAIL") or "research-mcp@example.com"
 
-MAX_COUNT = 25
+# Scopus serves at most 25 hits per request on a key without institutional
+# entitlement, so larger result sets are collected page by page (`start`).
+SCOPUS_PAGE_SIZE = 25
+# Cap for one search_scopus call: 200 hits = 8 Scopus requests, and the compact
+# output keeps that readable in a conversation.
+SCOPUS_MAX_RESULTS = 200
+# Cap for export_scopus_results, which writes to disk instead of the chat:
+# 2000 hits = 80 requests. Scopus itself stops paging at start=5000.
+SCOPUS_EXPORT_MAX = 2000
+SCOPUS_EXPORT_PAUSE = 0.2  # seconds between export pages; module-level so tests can zero it
+# OpenAlex allows 200 per page without quota; 100 keeps citation lists readable.
+OPENALEX_MAX_COUNT = 100
+# assess_relevance returns abstracts, which are long: 25 papers per call stays.
+RELEVANCE_MAX_ITEMS = 25
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 4
 
 # OpenAlex accepts at most 50 values in a single OR-filter (a|b|c).
 OPENALEX_MAX_BATCH = 50
+
+# Folder export_scopus_results writes to. Set by the extension's "Export folder"
+# setting or the env block of a hand-written MCP config.
+EXPORT_DIR_ENV = "RESEARCH_EXPORT_DIR"
 
 # Scimago journal-rank table, used as a fallback when the Scopus key has no
 # Serial Title entitlement. Downloaded from https://www.scimagojr.com/journalrank.php
@@ -104,12 +123,46 @@ async def close_clients() -> None:
             await c.aclose()
 
 
-def _clamp_count(count: Any) -> int:
+def _clamp_count(count: Any, limit: int = SCOPUS_PAGE_SIZE, default: int = 5) -> int:
     try:
         n = int(count)
     except (TypeError, ValueError):
-        return 5
-    return max(1, min(n, MAX_COUNT))
+        return default
+    return max(1, min(n, limit))
+
+
+def _clamp_start(start: Any) -> int:
+    try:
+        return max(0, int(start))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _clamp_page(page: Any) -> int:
+    try:
+        return max(1, int(page))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _to_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mcp_version() -> str:
+    """Package version, recorded in search responses for the search log."""
+    try:
+        return importlib_metadata.version("research-mcp")
+    except importlib_metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _now_iso() -> str:
+    """Local time with UTC offset, second precision (PRISMA-S search log)."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 async def _get_with_retry(
@@ -252,14 +305,17 @@ def _content_terms(text: str) -> set[str]:
 
 # ── Scopus Search ─────────────────────────────────────────────────────────────
 
-async def search_scopus(query: str, count: int = 5, sort: str = "coverDate") -> list[dict]:
-    r = await _scopus_get("content/search/scopus", {
-        "query": query, "count": _clamp_count(count), "sort": sort, "view": "STANDARD",
-    })
-    r.raise_for_status()
-    entries = r.json().get("search-results", {}).get("entry", [])
-    return [{
-        "scopus_id":        e.get("dc:identifier", "").replace("SCOPUS_ID:", ""),
+# Column order of a full Scopus result; also the CSV header of an export.
+_SCOPUS_FIELDS = [
+    "scopus_id", "title", "creator", "publication_name", "issn", "e_issn",
+    "cover_date", "doi", "cited_by_count", "aggregation_type", "url",
+]
+_SCOPUS_COMPACT_FIELDS = ["scopus_id", "title", "year", "doi", "cited_by_count", "publication_name"]
+
+
+def _scopus_entry(e: dict, compact: bool = False) -> dict:
+    full = {
+        "scopus_id":        (e.get("dc:identifier") or "").replace("SCOPUS_ID:", ""),
         "title":            e.get("dc:title"),
         "creator":          e.get("dc:creator"),
         "publication_name": e.get("prism:publicationName"),
@@ -270,7 +326,195 @@ async def search_scopus(query: str, count: int = 5, sort: str = "coverDate") -> 
         "cited_by_count":   e.get("citedby-count"),
         "aggregation_type": e.get("prism:aggregationType"),
         "url": next((l["@href"] for l in e.get("link", []) if l.get("@ref") == "scopus"), None),
-    } for e in entries]
+    }
+    if not compact:
+        return full
+    full["year"] = (full["cover_date"] or "")[:4] or None
+    return {k: full[k] for k in _SCOPUS_COMPACT_FIELDS}
+
+
+async def _scopus_page(query: str, start: int, count: int, sort: str) -> tuple[list[dict], Optional[int]]:
+    """One Scopus Search request. Returns (raw entries, total hit count).
+
+    An empty result set is not an empty list: Scopus answers with a single
+    pseudo-entry {"@_fa": "true", "error": "Result set was empty"}, which used
+    to surface as a record with every field blank. Drop it, and anything else
+    without an identifier.
+    """
+    r = await _scopus_get("content/search/scopus", {
+        "query": query, "count": count, "start": start, "sort": sort, "view": "STANDARD",
+    })
+    r.raise_for_status()
+    sr = r.json().get("search-results", {})
+    total = _to_int(sr.get("opensearch:totalResults"))
+    entries = [
+        e for e in (sr.get("entry") or [])
+        if isinstance(e, dict) and e.get("dc:identifier") and "error" not in e
+    ]
+    return entries, total
+
+
+async def _scopus_collect(
+    query: str, start: int, limit: int, sort: str, pause: float = 0.0
+) -> tuple[list[dict], Optional[int], int]:
+    """Page through Scopus from `start` until `limit` entries are collected or
+    the result set ends. Returns (entries, total hit count, requests made)."""
+    entries: list[dict] = []
+    total: Optional[int] = None
+    calls = 0
+    offset = start
+    while len(entries) < limit:
+        page_size = min(SCOPUS_PAGE_SIZE, limit - len(entries))
+        if calls and pause:
+            await asyncio.sleep(pause)
+        page, total = await _scopus_page(query, offset, page_size, sort)
+        calls += 1
+        entries.extend(page)
+        offset += len(page)
+        if len(page) < page_size:
+            break  # short page: the result set is exhausted
+        if total is not None and offset >= total:
+            break
+    return entries, total, calls
+
+
+async def search_scopus(
+    query: str,
+    count: int = 5,
+    sort: str = "coverDate",
+    start: int = 0,
+    count_only: bool = False,
+    compact: Optional[bool] = None,
+) -> dict:
+    """Search Scopus. The query string is sent to Scopus exactly as given.
+
+    Every response carries what a search log needs: the query as sent, the total
+    hit count, the retrieval time and the server version. `count_only` costs one
+    request and returns no records; `count` above 25 pages through Scopus
+    (25 per request) and switches to compact records unless `compact=False`.
+    """
+    start = _clamp_start(start)
+    out: dict[str, Any] = {
+        "query": query,
+        "total_results": None,
+        "returned": 0,
+        "start": start,
+        "next_start": None,
+        "retrieved_at": _now_iso(),
+        "mcp_version": _mcp_version(),
+        "quota_remaining": None,
+    }
+    if count_only:
+        _, total, _ = await _scopus_collect(query, start, 1, sort)
+        out.update({"total_results": total, "quota_remaining": _quota_info.get("remaining")})
+        out["note"] = "count_only: no records were fetched (one Scopus request)."
+        return out
+
+    n = _clamp_count(count, SCOPUS_MAX_RESULTS)
+    if compact is None:
+        compact = n > SCOPUS_PAGE_SIZE
+    entries, total, _ = await _scopus_collect(query, start, n, sort)
+    results = [_scopus_entry(e, compact=compact) for e in entries]
+    more = len(results) == n and (total is None or start + len(results) < total)
+    out.update({
+        "total_results": total,
+        "returned": len(results),
+        "next_start": start + len(results) if more else None,
+        "quota_remaining": _quota_info.get("remaining"),
+        "results": results,
+    })
+    if compact:
+        out["note"] = "Compact records (count > 25). Pass compact=false for all fields."
+    return out
+
+
+_EXPORT_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+async def export_scopus_results(
+    query: str,
+    filename: str,
+    sort: str = "coverDate",
+    max_results: int = SCOPUS_EXPORT_MAX,
+    format: str = "csv",
+) -> dict:
+    """Page through a whole Scopus result set and write it to a file.
+
+    Meant for result sets too large for a conversation (up to 2000 hits, 80
+    requests). Nothing from the file is returned; the response carries the hit
+    count, the path and the search-log metadata. A `<name>.meta.json` sits next
+    to the data file with the same metadata.
+    """
+    directory = os.environ.get(EXPORT_DIR_ENV) or ""
+    if not directory:
+        return {
+            "error": f"{EXPORT_DIR_ENV} is not set. Point it at the folder exports should go to: "
+                     "the extension's 'Export folder' setting, or the env block of your MCP config."
+        }
+    fmt = str(format or "csv").lower()
+    if fmt not in ("csv", "json"):
+        return {"error": "format must be 'csv' or 'json'."}
+
+    # Only a bare file name is accepted; path separators and odd characters go.
+    name = Path(str(filename or "")).name
+    if name.lower().endswith((".csv", ".json")):
+        name = name.rsplit(".", 1)[0]
+    name = _EXPORT_NAME_RE.sub("_", name).strip("._")
+    if not name:
+        return {"error": "filename must contain at least one letter or digit."}
+
+    out_dir = Path(directory).expanduser()
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return {"error": f"Cannot use export folder {out_dir}: {e}"}
+    path = out_dir / f"{name}.{fmt}"
+    meta_path = out_dir / f"{name}.meta.json"
+    if path.exists():
+        return {"error": f"{path} already exists; choose another filename."}
+
+    limit = _clamp_count(max_results, SCOPUS_EXPORT_MAX, default=SCOPUS_EXPORT_MAX)
+    retrieved_at = _now_iso()
+    entries, total, calls = await _scopus_collect(query, 0, limit, sort, pause=SCOPUS_EXPORT_PAUSE)
+    rows = [_scopus_entry(e) for e in entries]
+    truncated = (total is not None and len(rows) < total) or (total is None and len(rows) >= limit)
+
+    meta = {
+        "query": query,
+        "sort": sort,
+        "total_results": total,
+        "exported": len(rows),
+        "truncated": truncated,
+        "retrieved_at": retrieved_at,
+        "mcp_version": _mcp_version(),
+        "source": "scopus",
+    }
+    try:
+        if fmt == "csv":
+            # UTF-8 with BOM and ';' so Excel opens it correctly without an import dialog.
+            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                writer = csv.DictWriter(fh, fieldnames=_SCOPUS_FIELDS, delimiter=";")
+                writer.writeheader()
+                writer.writerows(rows)
+        else:
+            path.write_text(json.dumps({**meta, "results": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        return {"error": f"Could not write {path}: {e}"}
+
+    result: dict[str, Any] = {
+        **meta,
+        "path": str(path),
+        "meta_path": str(meta_path),
+        "quota_remaining": _quota_info.get("remaining"),
+        "scopus_calls": calls,
+    }
+    if truncated:
+        result["note"] = (
+            f"Export stopped at {len(rows)} of {total if total is not None else 'an unknown number of'} "
+            f"hits (limit {limit}). Narrow the query, or raise max_results up to {SCOPUS_EXPORT_MAX}."
+        )
+    return result
 
 
 # ── Abstract details: Scopus metadata + CrossRef abstract ─────────────────────
@@ -366,7 +610,7 @@ async def get_author_profile(author_name: str) -> dict:
 
 # ── Forward citations (papers citing this one) ────────────────────────────────
 
-async def _citing_openalex(identifier: str, count: int) -> dict:
+async def _citing_openalex(identifier: str, count: int, page: int = 1) -> dict:
     ref, err = await _openalex_ref(identifier)
     if err:
         return err
@@ -387,36 +631,47 @@ async def _citing_openalex(identifier: str, count: int) -> dict:
         "select": _SUMMARY_SELECT,
         "sort": "cited_by_count:desc",
         "per-page": count,
+        "page": page,
     })
     if r.status_code != 200:
         return {"error": f"OpenAlex returned HTTP {r.status_code}"}
     data = r.json()
+    total = _to_int(data.get("meta", {}).get("count"))
     return {
         "source_paper": {"openalex_id": ref},
         "direction": "forward",
-        "total_citing": data.get("meta", {}).get("count"),
+        "total_citing": total,
+        "page": page,
+        "per_page": count,
+        "next_page": page + 1 if (total is not None and page * count < total) else None,
         "citing_papers": [_work_summary(w) for w in data.get("results", [])],
         "note": "Forward citations from OpenAlex (free, no Scopus quota), most-cited first.",
     }
 
 
 async def get_citing_papers(
-    scopus_id: str, count: int = 5, sort: str = "coverDate", source: str = "openalex"
+    scopus_id: str,
+    count: int = 5,
+    sort: str = "coverDate",
+    source: str = "openalex",
+    page: int = 1,
+    start: int = 0,
 ) -> Any:
     """Papers citing a document.
 
     Defaults to OpenAlex because Scopus gates forward-citation search: REFEID() is a
     restricted field that returns HTTP 400 INVALID_INPUT without an institutional
     subscription, so source='scopus' only works for subscribed requestors.
+    `page` pages OpenAlex (1-based); `start` pages Scopus (0-based offset).
     """
     if str(source).lower() == "openalex":
-        return await _citing_openalex(scopus_id, _clamp_count(count))
+        return await _citing_openalex(scopus_id, _clamp_count(count, OPENALEX_MAX_COUNT), _clamp_page(page))
 
     # REFEID() only accepts a Scopus ID. A DOI would build invalid query syntax and
     # come back as an opaque HTTP 400, so resolve it to a Scopus ID first.
     kind, value = _classify_identifier(scopus_id)
     if kind == "doi":
-        matches = await search_scopus(f"DOI({value})", count=1)
+        matches = (await search_scopus(f"DOI({value})", count=1)).get("results") or []
         sid = matches[0].get("scopus_id") if matches else None
         if not sid:
             return {
@@ -431,7 +686,7 @@ async def get_citing_papers(
         }
 
     try:
-        return await search_scopus(f"REFEID({value})", count=count, sort=sort)
+        return await search_scopus(f"REFEID({value})", count=count, sort=sort, start=start)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 400 and "INVALID_INPUT" in e.response.text:
             return {
@@ -463,13 +718,16 @@ async def _crossref_references(doi: str) -> list[dict]:
     } for ref in refs]
 
 
-async def get_references(identifier: str, count: int = 10) -> dict:
+async def get_references(identifier: str, count: int = 10, start: int = 0) -> dict:
     """Works cited BY the given paper (backward citations), via OpenAlex.
 
     Scopus cannot serve this on a free key (view=REF returns 401), so OpenAlex is
-    the primary source, with CrossRef as a fallback.
+    the primary source, with CrossRef as a fallback. Each call ranks a window of
+    the reference list (at least 50 entries from `start`) by citations and
+    returns the top `count`; `next_start` points at the following window.
     """
-    n = _clamp_count(count)
+    n = _clamp_count(count, OPENALEX_MAX_COUNT, default=10)
+    start = _clamp_start(start)
     ref, err = await _openalex_ref(identifier)
     if err:
         return err
@@ -489,11 +747,15 @@ async def get_references(identifier: str, count: int = 10) -> dict:
 
     if not ref_ids:
         fallback = await _crossref_references(source_paper["doi"]) if source_paper["doi"] else []
+        page = fallback[start:start + n]
         return {
             "source_paper": source_paper,
             "direction": "backward",
             "total_references": len(fallback),
-            "references": fallback[:n],
+            "start": start,
+            "count": len(page),
+            "next_start": start + n if start + n < len(fallback) else None,
+            "references": page,
             "note": (
                 "OpenAlex holds no reference list for this work; entries came from CrossRef "
                 "and are less structured." if fallback else
@@ -501,23 +763,28 @@ async def get_references(identifier: str, count: int = 10) -> dict:
             ),
         }
 
-    # Hydrate at most one batch, then surface the most-cited references first.
-    hydrated = await _openalex_batch(ref_ids[:OPENALEX_MAX_BATCH])
+    # Rank a window of at least one batch from `start`, then return the most-cited.
+    window = ref_ids[start:start + max(n, OPENALEX_MAX_BATCH)]
+    hydrated = await _openalex_batch(window)
     refs = sorted(
         (_work_summary(w) for w in hydrated),
         key=lambda x: x.get("cited_by_count") or 0,
         reverse=True,
-    )
+    )[:n]
+    window_end = start + len(window)
     result = {
         "source_paper": source_paper,
         "direction": "backward",
         "total_references": len(ref_ids),
-        "references": refs[:n],
+        "start": start,
+        "count": len(refs),
+        "next_start": window_end if window_end < len(ref_ids) else None,
+        "references": refs,
     }
-    if len(ref_ids) > OPENALEX_MAX_BATCH:
+    if result["next_start"] is not None:
         result["note"] = (
-            f"This work lists {len(ref_ids)} references; ranking considered the first "
-            f"{OPENALEX_MAX_BATCH} and returned the most-cited of those."
+            f"This work lists {len(ref_ids)} references; this call ranked entries "
+            f"{start + 1}-{window_end} by citations. Pass start={window_end} for the next window."
         )
     return result
 
@@ -533,7 +800,7 @@ async def assess_relevance(identifiers: Any, research_context: str) -> dict:
     """
     if isinstance(identifiers, str):
         identifiers = [identifiers]
-    idents = [str(i).strip() for i in (identifiers or []) if str(i).strip()][:MAX_COUNT]
+    idents = [str(i).strip() for i in (identifiers or []) if str(i).strip()][:RELEVANCE_MAX_ITEMS]
     if not idents:
         return {"error": "Provide at least one identifier (DOI, OpenAlex ID or Scopus ID)."}
     if not (research_context or "").strip():
@@ -953,7 +1220,25 @@ def get_quota_status() -> dict:
 
 # ── MCP wiring ────────────────────────────────────────────────────────────────
 
-_COUNT_SCHEMA = {"type": "integer", "description": f"Results to return (default 5, max {MAX_COUNT}).", "default": 5, "maximum": MAX_COUNT}
+_SCOPUS_COUNT_SCHEMA = {
+    "type": "integer",
+    "description": (
+        f"Results to return (default 5, max {SCOPUS_MAX_RESULTS}). Scopus serves {SCOPUS_PAGE_SIZE} per "
+        f"request, so larger values cost one request per {SCOPUS_PAGE_SIZE} hits; above {SCOPUS_PAGE_SIZE} "
+        "the records come back compact unless compact=false."
+    ),
+    "default": 5, "minimum": 1, "maximum": SCOPUS_MAX_RESULTS,
+}
+_OPENALEX_COUNT_SCHEMA = {
+    "type": "integer",
+    "description": f"Results to return (default 5, max {OPENALEX_MAX_COUNT}).",
+    "default": 5, "minimum": 1, "maximum": OPENALEX_MAX_COUNT,
+}
+_START_SCHEMA = {
+    "type": "integer",
+    "description": "0-based offset of the first result. Pass next_start from a previous response to get the next page.",
+    "default": 0, "minimum": 0,
+}
 _SORT_SCHEMA = {"type": "string", "description": "Sort by 'coverDate' or 'relevancy'.", "default": "coverDate"}
 _IDENTIFIER_SCHEMA = {
     "type": "string",
@@ -967,15 +1252,57 @@ async def handle_list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="search_scopus",
-            description="Search for documents in Scopus by query string. Returns title, DOI, Scopus ID, citation count and journal for each match.",
+            description=(
+                "Search for documents in Scopus by query string (sent exactly as given). Returns the "
+                "total number of hits (total_results), the query, the retrieval time and the server "
+                "version for a search log, plus one page of records (title, DOI, Scopus ID, citation "
+                "count, journal). Use count_only=true to get just the hit count in one request; use "
+                "start / next_start to page."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Scopus query, e.g. \"TITLE(agile) AND PUBYEAR > 2020\"."},
-                    "count": _COUNT_SCHEMA,
+                    "count": _SCOPUS_COUNT_SCHEMA,
                     "sort": _SORT_SCHEMA,
+                    "start": _START_SCHEMA,
+                    "count_only": {
+                        "type": "boolean",
+                        "description": "Return only total_results (one Scopus request, no records). Ideal for counting hits per search string.",
+                        "default": False,
+                    },
+                    "compact": {
+                        "type": "boolean",
+                        "description": f"Compact records (scopus_id, title, year, doi, cited_by_count, publication_name). Default: true when count > {SCOPUS_PAGE_SIZE}, else false.",
+                    },
                 },
                 "required": ["query"],
+            },
+        ),
+        types.Tool(
+            name="export_scopus_results",
+            description=(
+                f"Page through a whole Scopus result set (up to {SCOPUS_EXPORT_MAX} hits, "
+                f"{SCOPUS_PAGE_SIZE} per request) and write it to a CSV or JSON file in the configured "
+                "export folder, with a .meta.json search-log record beside it. Returns the hit count and "
+                "the file path, never the records themselves. Use this instead of search_scopus when a "
+                "result set is too large for the conversation."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Scopus query, sent exactly as given."},
+                    "filename": {"type": "string", "description": "Bare file name without folder, e.g. \"it-governance-2026-11-01\". The extension is added."},
+                    "sort": _SORT_SCHEMA,
+                    "max_results": {
+                        "type": "integer",
+                        "description": f"Stop after this many hits (default and max {SCOPUS_EXPORT_MAX}).",
+                        "default": SCOPUS_EXPORT_MAX, "minimum": 1, "maximum": SCOPUS_EXPORT_MAX,
+                    },
+                    "format": {"type": "string", "enum": ["csv", "json"], "default": "csv",
+                               "description": "csv (semicolon-separated, Excel-ready) or json."},
+                },
+                "required": ["query", "filename"],
             },
         ),
         types.Tool(
@@ -1012,7 +1339,7 @@ async def handle_list_tools() -> list[types.Tool]:
                         "description": "Document identifier: a DOI or OpenAlex work ID (default "
                                        "OpenAlex source), or a Scopus ID.",
                     },
-                    "count": _COUNT_SCHEMA,
+                    "count": _OPENALEX_COUNT_SCHEMA,
                     "sort": _SORT_SCHEMA,
                     "source": {
                         "type": "string",
@@ -1021,6 +1348,12 @@ async def handle_list_tools() -> list[types.Tool]:
                                        "requires an institutional subscription.",
                         "default": "openalex",
                     },
+                    "page": {
+                        "type": "integer",
+                        "description": "1-based page for source='openalex'. Pass next_page from a previous response.",
+                        "default": 1, "minimum": 1,
+                    },
+                    "start": {**_START_SCHEMA, "description": "0-based offset for source='scopus'."},
                 },
                 "required": ["scopus_id"],
             },
@@ -1037,7 +1370,8 @@ async def handle_list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "identifier": _IDENTIFIER_SCHEMA,
-                    "count": {"type": "integer", "description": f"References to return (default 10, max {MAX_COUNT}).", "default": 10, "maximum": MAX_COUNT},
+                    "count": {"type": "integer", "description": f"References to return (default 10, max {OPENALEX_MAX_COUNT}).", "default": 10, "minimum": 1, "maximum": OPENALEX_MAX_COUNT},
+                    "start": {**_START_SCHEMA, "description": "0-based offset into the reference list. Pass next_start from a previous response."},
                 },
                 "required": ["identifier"],
             },
@@ -1057,8 +1391,8 @@ async def handle_list_tools() -> list[types.Tool]:
                     "identifiers": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": f"Up to {MAX_COUNT} paper identifiers (DOI, OpenAlex ID or Scopus ID).",
-                        "maxItems": MAX_COUNT,
+                        "description": f"Up to {RELEVANCE_MAX_ITEMS} paper identifiers (DOI, OpenAlex ID or Scopus ID).",
+                        "maxItems": RELEVANCE_MAX_ITEMS,
                     },
                     "research_context": {
                         "type": "string",
@@ -1104,7 +1438,22 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
     args = arguments or {}
     try:
         if name == "search_scopus":
-            result = await search_scopus(args["query"], count=args.get("count", 5), sort=args.get("sort", "coverDate"))
+            result = await search_scopus(
+                args["query"],
+                count=args.get("count", 5),
+                sort=args.get("sort", "coverDate"),
+                start=args.get("start", 0),
+                count_only=bool(args.get("count_only", False)),
+                compact=args.get("compact"),
+            )
+        elif name == "export_scopus_results":
+            result = await export_scopus_results(
+                args["query"],
+                args["filename"],
+                sort=args.get("sort", "coverDate"),
+                max_results=args.get("max_results", SCOPUS_EXPORT_MAX),
+                format=args.get("format", "csv"),
+            )
         elif name == "get_abstract_details":
             result = await get_abstract_details(args["scopus_id"])
         elif name == "get_author_profile":
@@ -1115,10 +1464,14 @@ async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[
                 count=args.get("count", 5),
                 sort=args.get("sort", "coverDate"),
                 source=args.get("source", "openalex"),
+                page=args.get("page", 1),
+                start=args.get("start", 0),
             )
         elif name == "get_references":
             result = await get_references(
-                args.get("identifier") or args["scopus_id"], count=args.get("count", 10)
+                args.get("identifier") or args["scopus_id"],
+                count=args.get("count", 10),
+                start=args.get("start", 0),
             )
         elif name == "assess_relevance":
             result = await assess_relevance(args["identifiers"], args["research_context"])
