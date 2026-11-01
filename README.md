@@ -155,6 +155,14 @@ platform-independent — vendoring would not work here, because the MCP SDK depe
 on the compiled `pydantic-core`, which cannot be bundled portably across macOS,
 Windows and Linux.
 
+**It does not bundle Python either.** On first start the host runs `uv` with
+`--python-preference system`: a Python ≥ 3.10 that is already installed on the
+machine is used as is; only when none qualifies does uv download a private one
+(~30 MB, once). That first start can take up to a minute; later starts are
+instant. The server logs which interpreter it runs on
+(`Starting research-mcp: Python 3.x from … (already installed on this machine)`),
+visible in the extension's log in Claude Desktop's settings.
+
 ### Option B — Claude Code / Claude Desktop, configured by hand (no server needed)
 
 This is the simplest path. The server runs **locally as a stdio process** —

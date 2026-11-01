@@ -23,7 +23,7 @@
     "entry_point": "research_mcp/server.py",
     "mcp_config": {
       "command": "uv",
-      "args": ["run", "--directory", "${__dirname}", "research-mcp"],
+      "args": ["run", "--python-preference", "system", "--directory", "${__dirname}", "research-mcp"],
       "env": {
         "SCOPUS_API_KEY": "${user_config.scopus_api_key}",
         "UNPAYWALL_EMAIL": "${user_config.unpaywall_email}"

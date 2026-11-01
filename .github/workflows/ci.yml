@@ -30,3 +30,30 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+  # Keeps the Claude Desktop extension buildable on every change: the manifest
+  # must validate, its version must match pyproject.toml, and a trial pack must
+  # succeed. The release workflow repeats this, but failing here is cheaper.
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate manifest
+        run: npx --yes @anthropic-ai/mcpb@2 validate manifest.json
+
+      - name: Check manifest version matches pyproject.toml
+        run: |
+          have="$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)"
+          mani="$(jq -r '.version' manifest.json)"
+          if [ "$have" != "$mani" ]; then
+            echo "::error::pyproject.toml says $have but manifest.json says $mani."
+            exit 1
+          fi
+
+      - name: Trial pack
+        run: npx --yes @anthropic-ai/mcpb@2 pack . "${RUNNER_TEMP}/research-mcp.mcpb"

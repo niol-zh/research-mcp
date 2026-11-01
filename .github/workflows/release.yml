@@ -44,6 +44,13 @@ jobs:
           fi
           echo "sha=$(git rev-parse "$sha")" >> "$GITHUB_OUTPUT"
 
+      # Everything below (version check, bundle build, release notes) must come
+      # from the commit being tagged, not from the branch head.
+      - name: Check out the target commit
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: git checkout --quiet "$SHA"
+
       - name: Check tag matches the packaged version
         env:
           TAG: ${{ inputs.tag }}
