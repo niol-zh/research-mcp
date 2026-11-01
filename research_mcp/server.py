@@ -478,6 +478,41 @@ async def search_scopus(
 _EXPORT_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
+def _resolve_export_dir() -> tuple[Optional[Path], Optional[str], list[str]]:
+    """Pick the export folder: environment, then config file, then the default.
+
+    The first candidate that can actually be created wins. A host may hand over
+    a folder that cannot exist (Claude Desktop once resolved its "${DOCUMENTS}"
+    placeholder to C:\\Users\\.<name>\\Documents) or leave a placeholder
+    unresolved; blindly trusting it would hide the user's own config.
+    Returns (folder, source, skipped descriptions).
+    """
+    candidates: list[tuple[str, str]] = []
+    env_dir = os.environ.get(EXPORT_DIR_ENV) or ""
+    if env_dir:
+        candidates.append((f"environment ({EXPORT_DIR_ENV})", env_dir))
+    file_dir = _load_config_file().get("export_dir") or ""
+    if file_dir:
+        candidates.append((f"config file ({_config_path()})", file_dir))
+    candidates.append(("default", str(DEFAULT_EXPORT_DIR)))
+
+    skipped: list[str] = []
+    for source, raw in candidates:
+        if "${" in raw:
+            skipped.append(f"{source}: unresolved placeholder {raw!r}")
+            continue
+        folder = Path(raw).expanduser()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            skipped.append(f"{source}: {folder} ({e})")
+            continue
+        if skipped:
+            logger.warning("Export folder: using %s after skipping %s", source, "; ".join(skipped))
+        return folder, source, skipped
+    return None, None, skipped
+
+
 async def export_scopus_results(
     query: str,
     filename: str,
@@ -492,11 +527,6 @@ async def export_scopus_results(
     count, the path and the search-log metadata. A `<name>.meta.json` sits next
     to the data file with the same metadata.
     """
-    # Explicit folder from the extension's "Export folder" setting, the env block
-    # of an MCP config, or "export_dir" in the config file; otherwise a folder in
-    # the home directory, which exists wherever the server runs (including the
-    # Linux VM that Claude Cowork uses on Windows).
-    directory = _setting(EXPORT_DIR_ENV, "export_dir") or str(DEFAULT_EXPORT_DIR)
     fmt = str(format or "csv").lower()
     if fmt not in ("csv", "json"):
         return {"error": "format must be 'csv' or 'json'."}
@@ -509,11 +539,9 @@ async def export_scopus_results(
     if not name:
         return {"error": "filename must contain at least one letter or digit."}
 
-    out_dir = Path(directory).expanduser()
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        return {"error": f"Cannot use export folder {out_dir}: {e}"}
+    out_dir, dir_source, skipped = _resolve_export_dir()
+    if out_dir is None:
+        return {"error": "No usable export folder. Tried: " + "; ".join(skipped)}
     path = out_dir / f"{name}.{fmt}"
     meta_path = out_dir / f"{name}.meta.json"
     if path.exists():
@@ -552,9 +580,12 @@ async def export_scopus_results(
         **meta,
         "path": str(path),
         "meta_path": str(meta_path),
+        "export_dir_source": dir_source,
         "quota_remaining": _quota_info.get("remaining"),
         "scopus_calls": calls,
     }
+    if skipped:
+        result["export_dir_note"] = "Skipped unusable folder(s): " + "; ".join(skipped)
     if truncated:
         result["note"] = (
             f"Export stopped at {len(rows)} of {total if total is not None else 'an unknown number of'} "
