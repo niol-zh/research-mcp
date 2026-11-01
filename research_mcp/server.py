@@ -96,6 +96,7 @@ OPENALEX_MAX_BATCH = 50
 # Folder export_scopus_results writes to. Set by the extension's "Export folder"
 # setting or the env block of a hand-written MCP config.
 EXPORT_DIR_ENV = "RESEARCH_EXPORT_DIR"
+DEFAULT_EXPORT_DIR = Path.home() / "research-mcp"
 
 # Scimago journal-rank table, used as a fallback when the Scopus key has no
 # Serial Title entitlement. Downloaded from https://www.scimagojr.com/journalrank.php
@@ -491,13 +492,11 @@ async def export_scopus_results(
     count, the path and the search-log metadata. A `<name>.meta.json` sits next
     to the data file with the same metadata.
     """
-    directory = _setting(EXPORT_DIR_ENV, "export_dir")
-    if not directory:
-        return {
-            "error": f"{EXPORT_DIR_ENV} is not set. Point it at the folder exports should go to: "
-                     "the extension's 'Export folder' setting, the env block of your MCP config, "
-                     f'or {{"export_dir": "..."}} in {_config_path()}.'
-        }
+    # Explicit folder from the extension's "Export folder" setting, the env block
+    # of an MCP config, or "export_dir" in the config file; otherwise a folder in
+    # the home directory, which exists wherever the server runs (including the
+    # Linux VM that Claude Cowork uses on Windows).
+    directory = _setting(EXPORT_DIR_ENV, "export_dir") or str(DEFAULT_EXPORT_DIR)
     fmt = str(format or "csv").lower()
     if fmt not in ("csv", "json"):
         return {"error": "format must be 'csv' or 'json'."}

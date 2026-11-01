@@ -211,10 +211,16 @@ async def test_export_json_and_truncation(monkeypatch, export_dir):
 
 
 @pytest.mark.asyncio
-async def test_export_requires_export_dir(monkeypatch):
+async def test_export_defaults_to_home_folder(monkeypatch, tmp_path):
     monkeypatch.delenv(server.EXPORT_DIR_ENV, raising=False)
+    monkeypatch.setattr(server, "_config_cache", {})
+    monkeypatch.setattr(server, "DEFAULT_EXPORT_DIR", tmp_path / "home" / "research-mcp")
+    monkeypatch.setattr(server, "SCOPUS_EXPORT_PAUSE", 0.0)
+    calls = []
+    monkeypatch.setattr(server, "scopus_client", lambda: _client(_scopus_mock(2, calls)))
     out = await server.export_scopus_results("q", "x")
-    assert server.EXPORT_DIR_ENV in out["error"]
+    assert out["path"] == str(tmp_path / "home" / "research-mcp" / "x.csv")
+    assert (tmp_path / "home" / "research-mcp" / "x.csv").is_file()
 
 
 @pytest.mark.asyncio

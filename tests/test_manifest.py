@@ -81,16 +81,19 @@ def test_plugin_manifest_basics(plugin):
     assert plugin["version"] == _pyproject_version()
 
 
-def test_plugin_runs_the_console_script_with_system_python(plugin):
+def test_plugin_starts_the_server_from_github_without_placeholders(plugin):
     cfg = plugin["mcpServers"]["research"]
-    assert cfg["command"] == "uv"
-    assert cfg["args"][:3] == ["run", "--python-preference", "system"]
-    assert "${CLAUDE_PLUGIN_ROOT}" in cfg["args"]
-    assert cfg["args"][-1] == "research-mcp"
-    # the venv lives outside the plugin directory so updates do not wipe it
-    assert cfg["env"]["UV_PROJECT_ENVIRONMENT"].startswith("${CLAUDE_PLUGIN_DATA}")
-    # no secrets in the plugin: Cowork has no settings dialog, the config file does that
-    assert not any(k in cfg["env"] for k in ("SCOPUS_API_KEY", "UNPAYWALL_EMAIL"))
+    # A POSIX shell one-liner: Claude Cowork runs plugin servers on Linux (on
+    # Windows inside its own VM), bootstraps uv there if missing, then starts the
+    # server from the release archive — no git, no plugin-path placeholders.
+    assert cfg["command"] == "sh" and cfg["args"][0] == "-c"
+    script = cfg["args"][1]
+    assert "astral.sh/uv/install.sh" in script
+    assert f"archive/refs/tags/v{_pyproject_version()}.zip research-mcp" in script
+    # Cowork does not resolve plugin placeholders or expose host variables, and
+    # a plugin must not carry secrets: the config file supplies the settings.
+    assert "env" not in cfg
+    assert "${CLAUDE" not in script
 
 
 def test_config_example_has_every_key():

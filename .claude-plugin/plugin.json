@@ -13,18 +13,11 @@
   "keywords": ["research", "scopus", "openalex", "citations", "academic", "bibliometrics"],
   "mcpServers": {
     "research": {
-      "command": "uv",
+      "command": "sh",
       "args": [
-        "run",
-        "--python-preference",
-        "system",
-        "--directory",
-        "${CLAUDE_PLUGIN_ROOT}",
-        "research-mcp"
-      ],
-      "env": {
-        "UV_PROJECT_ENVIRONMENT": "${CLAUDE_PLUGIN_DATA}/venv"
-      }
+        "-c",
+        "export PATH=\"$HOME/.local/bin:$PATH\"; command -v uvx >/dev/null 2>&1 || { curl -LsSf https://astral.sh/uv/install.sh || wget -qO- https://astral.sh/uv/install.sh; } | sh -s -- --quiet >&2; exec uvx --from https://github.com/niol-zh/research-mcp/archive/refs/tags/v0.7.0.zip research-mcp"
+      ]
     }
   }
 }

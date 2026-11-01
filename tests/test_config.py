@@ -67,8 +67,6 @@ def test_file_with_bom_is_accepted(_isolated_config):
 
 @pytest.mark.asyncio
 async def test_export_dir_from_file(_isolated_config, tmp_path, monkeypatch):
-    out = await server.export_scopus_results("q", "x")
-    assert server.EXPORT_DIR_ENV in out["error"] and "export_dir" in out["error"]
     export_dir = tmp_path / "exports"
     _isolated_config.write_text(json.dumps({"export_dir": str(export_dir)}), encoding="utf-8")
     monkeypatch.setattr(server, "_config_cache", None)

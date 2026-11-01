@@ -225,13 +225,9 @@ If you've cloned the repo and want to run from disk:
 
 Cowork sessions that run on your computer load local MCP servers from
 **plugins**. Plugins have no settings dialog, so the key and folders come from
-a small config file instead. Three steps:
+a small config file instead. Two steps:
 
-1. **Install uv** (once). Windows PowerShell:
-   `winget install astral-sh.uv` — or `irm https://astral.sh/uv/install.ps1 | iex`.
-   macOS: `brew install uv`. Python itself is not required; uv reuses an
-   installed Python ≥ 3.10 or fetches one.
-2. **Create the config file** at `%USERPROFILE%\.research-mcp\config.json`
+1. **Create the config file** at `%USERPROFILE%\.research-mcp\config.json`
    (macOS/Linux: `~/.research-mcp/config.json`), modelled on
    [`config.example.json`](config.example.json):
 
@@ -244,20 +240,35 @@ a small config file instead. Three steps:
    ```
 
    Environment variables, when set, take precedence over the file. A different
-   file location can be given via `RESEARCH_MCP_CONFIG`.
-3. **Upload the plugin.** Download `research-mcp-vX.Y.Z-plugin.zip` from the
+   file location can be given via `RESEARCH_MCP_CONFIG`. `export_dir` is
+   optional: without it exports go to `research-mcp` in the home folder of
+   wherever the server runs.
+2. **Upload the plugin.** Download `research-mcp-vX.Y.Z-plugin.zip` from the
    [latest release](https://github.com/niol-zh/research-mcp/releases/latest)
    and add it under **Customize → Plugins → Add → Upload plugin**. Keep the
    `.zip` extension; the upload rejects `.plugin` files.
 
-The first start installs `mcp` and `httpx` into a private environment and can
-take up to a minute; later starts are instant. The server's log shows which
-Python it runs on and whether the config file was found.
+Nothing needs to be installed by hand. The plugin's start command is a small
+shell script: it installs [uv](https://docs.astral.sh/uv/) if it is missing,
+then runs `uvx --from <GitHub archive of the release> research-mcp`. Cowork runs
+plugin servers on Linux — on Windows inside the VM the app manages — so that
+script, not a Windows program, is what gets started; it fetches the server and
+installs `mcp` and `httpx` into a private environment on first start (internet
+needed, up to a minute). The server's log shows which Python it runs on and
+whether the config file was found.
+
+**If the plugin does not start** (Cowork shows `could_not_prepare` or similar),
+[`scripts/diagnose-plugin.ps1`](scripts/diagnose-plugin.ps1) checks the config
+file and runs the same `uvx` start on the Windows host with a real MCP
+`initialize` request, which separates a config problem from an app problem.
+Then look at the app's logs under `%APPDATA%\Claude\logs`.
 
 > Plugins serve **Cowork** sessions. Chat in Claude Desktop uses the `.mcpb`
 > extension (Option A) or the hand-written config (Option B) instead.
 
-To build the zip yourself: `scripts/build-plugin.sh` (needs `git`, `uv`, `zip`).
+To build the zip yourself: `scripts/build-plugin.sh [--ref <branch>]` (needs
+`git`, `uv`, `jq`, `zip`). `--ref` points the start command at a branch or
+commit for testing before a release tag exists.
 
 ---
 
